@@ -1,0 +1,358 @@
+This is my client's requirement.
+=========
+I’m looking to roll out a single conversational engine that lives on my Web properties yet reaches customers across Voice, WhatsApp, Email, SMS and even RCS. The bot must handle the entire journey—driving Sales, providing Post-sales support, taking care of General customer support and running outbound Marketing nudges—all from one code-base.
+
+Here is what I need from you:
+
+• Build or configure the bot so it can be embedded on my site (Web is the primary platform).
+• Connect it to the listed channels through the appropriate APIs—WhatsApp Business, a voice gateway (Twilio, Vonage or a proposal you prefer), standard SMTP/IMAP for email and an SMS/RCS provider.
+• Design conversation flows that cover product discovery, purchase guidance, order tracking, issue resolution and promotional broadcasts, with hand-offs to live agents when required.
+• Provide an easy-to-use dashboard where I can tweak messages, review analytics and train new intents without touching code.
+• Deliver clean, well-documented code plus a brief video or live walkthrough so my team can maintain the solution after hand-over.
+
+I’ll supply brand guidelines, existing FAQ data and sample dialogues on request. If you have prior work that shows omnichannel bot experience—especially combining voice with WhatsApp—please include it with your proposal; it will help me choose faster.
+========
+This is dialogue between my client and me.
+===========
+hi
+in how many days i can expect same on vertex
+Hi.
+Nice to meet you.
+A
+me 2
+how are you
+Fine thanks.
+And sir_
+A
+in how many days you can deliver same
+I can deliver 7days.
+A
+and just to correct will use Tata call stemming service and not Twilio
+@aritrar6
+
+@Gilsaydith
+
+I can deliver 7days.
+grate
+ok i need human like voice and what will be per min cost of same
+????
+my networkspeed is slow.
+sorry sir.
+A
+ok no issues
+@aritrar6
+
+@aritrar6
+
+ok i need human like voice and what will be per min cost of same
+kindly answer
+It is about 0.5 to 1 INR per minute, but the price depends on the service used.
+A
+ok
+anything you want to ask me
+yes, I have some question.
+A
+please ask
+which language do you need for voice?
+And should voice calling be inbound, outbound, or both?
+Will you provide whatsapp business api, tata call api, sms and email api, or should I arrange them?
+Do you need live agent pport inside the bot dashboard?
+A
+@aritrar6
+
+@Gilsaydith
+
+which language do you need for voice?
+And should voice calling be inbound, outbound, or both?
+multilingual, both
+Okay.
+A
+@aritrar6
+
+@Gilsaydith
+
+Will you provide whatsapp business api, tata call api, sms and email api, or should I arrange them?
+tata and whatsapp api i will provide. rest need your expertise
+@aritrar6
+
+@Gilsaydith
+
+Do you need live agent pport inside the bot dashboard?
+please check www.salesplal.in
+yes, sir.
+@aritrar6
+
+please check www.salesplal.in
+It doesn't work.
+A
+means?
+https://www.salespal.in/
+I am sorry.
+A
+its ok
+yes.
+which language do you need for voice?
+A
+anything els you want to ask
+@aritrar6
+
+@Gilsaydith
+
+which language do you need for voice?
+hinglish, hindi, english and all major Indian language
+And do you have ready product data for training the bot?
+A
+what is that
+im not a tech person
+It means do you already have product details or faq data that I can use to brain the bot, like prodect info, customer questions or website content.
+If sir have it, I can use it directly.
+If not, I can help create basic flows trom scratch.
+A
+its a b2b platform so we need to have multiple brane
+I can set up the bot for multiple brands, each with its own product info, faqs, and conversations.
+A
+grate
+and it need to be instigate in my website
+yes, of course.
+A
+grate, anything les you wanted to ask???
+If sir give me with the project, I will ask sir questions as I work on it.
+Would sir give this project to me?
+A
+1 mm
+Okay.
+A
+so final is INR 40,000/-
+kindly conform
+yes, sir.
+A
+@aritrar6
+
+@Gilsaydith
+
+Would sir give this project to me?
+i will be happy
+Thanks sir.
+A
+done im giving you
+@aritrar6
+
+@Gilsaydith
+
+Thanks sir.
+your welcome
+So can sir create milestone?
+A
+yes
+Okay.
+Can sir create now?
+I can start work right now.
+A
+@aritrar6
+
+@Gilsaydith
+
+Can sir create now?
+yes
+Thanks sir.
+A
+Salespal flowchart 12jan26 (2).png
+Salespal flowchart 12jan26 (2).png
+will make payment
+@aritrar6
+
+@aritrar6
+
+
+Salespal flowchart 12jan26
+(2).png
+Salespal flowchart 12jan26 (2).png
+just a sample
+mail me meeting link tomorrow morning d.shah@mountt.com
+its not accepting my card
+image.png
+image.png
+give me sometime to arrange different card
+Okay.
+A
+image.png
+image.png
+its night 12 now, will do in morning. Be rest assured.
+Okay.
+sir, Have a good night.
+Good morning sir.
+Today
+
+A
+hi good morning
+my team is asking for sample project
+i want to make payment
+@aritrar6
+
+@Gilsaydith
+
+Good morning sir.
+you can check my website also. www.salespal.invery good morning
+just reached office
+hiii
+@aritrar6
+
+@Gilsaydith
+
+sir, Have a good night.
+sorry i missed that
+hay i want to make payment ????
+your there??
+A
+hi
+Hi, sir.
+I am here.
+A
+finalyy
+how are you
+Fine thanks.
+And sir_
+A
+@aritrar6
+
+@aritrar6
+
+my team is asking for sample project
+kindly share something on same
+what does mean?
+A
+as call latency should be minimal and it should not feel like bot. we want to see any of your past project you have some on same.
+What problem occurred?
+A
+no problem
+can i see any of your past project on same
+yes, just a second.
+A
+sure
+waiting
+https://www.vapi.ai/
+Please check, let me know the result.
+A
+you have worked on vapi??
+You can work on google vertex right?
+I participated in this project as a freelancer in a supporting role.
+A
+grate
+done
+So what should I do?
+@aritrar6
+
+You can work on google vertex right?
+yes, of course.
+Sir, please let me know the result.
+I am wating.
+If sir find another developer, please let me know.
+I don't think badly sir.
+A
+You will get same and i will get delivery's in 7 days, correct?
+yes, sir.
+I can do it within 7 days.
+A
+done
+Can sir create milestone?
+To be honest, if a milestone is not set, the work cannot be done.
+Also, 7 days is the minimum time, so I would appreciate it if sir could give me more time.
+please let me know the result.
+Milestone created by @aritrar6
+Project milestone
+—
+₹40000.00 INR
+Congratulations, your bid has been awarded!
+Click the Accept button below to start working.
+
+This project has a budget of ₹40000.00 INR and you will be charged a project commission of ₹4000.00 INR once you've accepted.
+
+Accept
+A
+PAYMENT DONE
+Project collaboration is easier with Workspaces!
+Use this workspace for structured discussions, task management and keeping all your resources in one place.
+
+Go to Workspace
+Accepted!
+You're all set to start working.
+
+Your client has created a workspace to manage this project. You can set reminders to post project updates in the workspace.
+
+Set reminders
+Thanks sir.
+A
+SO SORRY FOR DEALY
+I WAS ARRANGING FUNDS
+AS MY CARD WAS NOT WORKING
+@aritrar6
+
+@Gilsaydith
+
+Thanks sir.
+ALL THE BEST
+CAN WE GO ON A CALL TO EXPLAN MORE DETAILS?
+now what is next
+Sorry sir.
+A
+???
+I am not good at English. I use a translator.
+A
+its ok
+but how you will build my product
+Thanks sir understanding.
+A
+what all credential you need to build google vertex platform.
+My internet speed is slow.
+The response is currently delayed.
+A
+Project Title: Full-Stack AI Developer: Enterprise AI Sales/Marketing Bot (Google Cloud & Vertex AI)
+
+Project Budget: Fixed Price: ₹40,000 (INR)
+
+Project Objective:
+We are MOUNTT PRIME. We require an elite AI/Full-Stack Developer to build "SalesPal 360", an omnipresent B2B AI employee. This system will autonomously handle Marketing, Sales, Post-Sales, and Support via Voice, WhatsApp, SMS, Mail, and RCS.
+
+Core Technical & Deployment Mandates:
+
+Google Vertex AI: All Generative AI (Images/Carousels/Video creation) and Conversational NLP (Vernacular Voice/Text bots) MUST be powered by Google Vertex AI infrastructure.
+
+Google Cloud Platform (GCP): The entire backend architecture, webhooks, and databases must be hosted on our enterprise Google Cloud environment.
+
+Live Domain: Every module must be fully deployed, tested, and live on our primary domain: https://www.salespal.in/
+
+Zoho One Sync: Deep integration with our Zoho CRM, Zoho Subscriptions, and Zoho Desk.
+
+MILESTONE PAYMENT STRUCTURE (Strict Terms)
+The total budget is ₹40,000. It is divided into 5 strict milestones of 20% (₹8,000) each.
+Note: I will only release payment for a milestone once it is fully deployed on Google Cloud/salespal.in and I am 100% satisfied with the live, bug-free testing.
+
+Milestone 1: SalesPal Marketing (20% / ₹8,000)
+
+Deliverable: Integration of Google Vertex AI to autonomously generate social media assets (Images, Carousels, Video). Must auto-post to social channels, capture incoming leads, and push raw data directly to Zoho CRM. Must be deployed live on GCP.
+
+Milestone 2: SalesPal Sales (20% / ₹8,000)
+
+Deliverable: The Omnichannel Vernacular AI Bot (Voice & Text). The bot must instantly call/WhatsApp leads captured in Milestone 1, qualify them (Budget, Location, Timeline), and update the Zoho CRM pipeline. Must function flawlessly on salespal.in.
+
+Milestone 3: SalesPal Post-Sales (20% / ₹8,000)
+
+Deliverable: Payment & KYC Automation. Upon deal closure, the bot must auto-generate and send payment links via WhatsApp/SMS, intelligently follow up for pending payments, and collect/verify PAN/Aadhar cards via WhatsApp.
+
+Milestone 4: SalesPal Support (20% / ₹8,000)
+
+Deliverable: 24/7 Customer Care Bot. The AI must read from a centralized knowledge base to answer client FAQs across all channels. If it cannot solve an issue, it must auto-create an escalation ticket in Zoho Desk.
+
+Milestone 5: SalesPal 360 Integration & Source Code (20% / ₹8,000)
+
+Deliverable: The final Master Sync. All 4 modules must communicate perfectly as one unified "SalesPal 360" intelligence on https://www.salespal.in/. Final payment released ONLY after successful User Acceptance Testing (UAT), handover of all API keys, Google Cloud admin rights, and raw source code.
+I've updated milestone
+which date i will get delivery
+mail me ond.shah@mountt.com
+d.shah@mountt.com
+just a second.
+A
+ok waiting
+This platform does not allow external contact. I was told my account was restricted a few days ago after I made an external contact.
+Please share sir GCP access permissions, Zoho API, WhatsApp API, Tata API, and domain access permissions
+======
