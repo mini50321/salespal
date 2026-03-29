@@ -16,6 +16,9 @@ class Settings(BaseModel):
     firestore_collection_lead_dedupe: str = (
         os.getenv("FIRESTORE_COLLECTION_LEAD_DEDUPE") or f"{_fs_prefix}_lead_dedupe"
     )
+    firestore_collection_lead_idem: str = (
+        os.getenv("FIRESTORE_COLLECTION_LEAD_IDEM") or f"{_fs_prefix}_lead_idem"
+    )
     job_store_path: str = os.getenv("JOB_STORE_PATH", "job_store.json")
     post_store_path: str = os.getenv("POST_STORE_PATH", "post_store.json")
     lead_store_path: str = os.getenv("LEAD_STORE_PATH", "lead_store.json")

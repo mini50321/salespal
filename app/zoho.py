@@ -2,10 +2,41 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import json
+import os
 from typing import Any
 import requests
 
 from .settings import settings
+
+
+def _zoho_default_fields() -> dict[str, Any]:
+    raw = (os.getenv("ZOHO_LEAD_DEFAULT_FIELDS_JSON") or "").strip()
+    if not raw:
+        return {}
+    try:
+        d = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
+def zoho_first_row_outcome(resp: dict[str, Any]) -> tuple[bool, str | None, str | None]:
+    data = resp.get("data")
+    if not isinstance(data, list) or not data:
+        return False, None, "empty zoho response"
+    row = data[0]
+    if not isinstance(row, dict):
+        return False, None, "invalid zoho row"
+    code = str(row.get("code") or "")
+    msg = str(row.get("message") or row.get("status") or "")
+    if code in ("SUCCESS", "DUPLICATE_DATA"):
+        det = row.get("details")
+        rid = None
+        if isinstance(det, dict) and det.get("id"):
+            rid = str(det["id"])
+        return True, rid, None
+    return False, None, msg or code or "zoho error"
 
 
 def _now() -> datetime:
@@ -59,6 +90,9 @@ class ZohoClient:
     def ready(self) -> bool:
         return bool(settings.zoho_client_id and settings.zoho_client_secret and settings.zoho_refresh_token)
 
+    def ping(self) -> None:
+        _ = self._get_token()
+
     def _get_token(self) -> str:
         if self._token and self._token.expires_at > _now() + timedelta(seconds=20):
             return self._token.access_token
@@ -104,10 +138,13 @@ def map_lead_to_zoho(lead: Any) -> dict[str, Any]:
     company = (lead.company or "").strip() if getattr(lead, "company", None) else ""
     last_name = name or company or "Lead"
 
-    payload: dict[str, Any] = {
-        "Last_Name": last_name,
-        "Company": company or "Unknown",
-    }
+    payload: dict[str, Any] = dict(_zoho_default_fields())
+    payload.update(
+        {
+            "Last_Name": last_name,
+            "Company": company or "Unknown",
+        }
+    )
 
     email = getattr(lead, "email", None)
     phone = getattr(lead, "phone", None)
@@ -126,6 +163,12 @@ def map_lead_to_zoho(lead: Any) -> dict[str, Any]:
     brand_id = getattr(lead, "brand_id", None)
     if brand_id:
         payload["Description"] = (payload.get("Description", "") + f"\nbrand_id={brand_id}").strip()
+
+    utm = getattr(lead, "utm", None)
+    if isinstance(utm, dict) and utm:
+        parts = [f"{k}={v}" for k, v in sorted(utm.items(), key=lambda x: str(x[0])) if v is not None and str(v) != ""]
+        if parts:
+            payload["Description"] = (payload.get("Description", "") + "\nutm: " + ", ".join(parts)).strip()
 
     raw = getattr(lead, "raw", None)
     if isinstance(raw, dict) and isinstance(raw.get("zoho"), dict):

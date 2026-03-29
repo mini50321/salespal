@@ -16,8 +16,15 @@ from typing import Any
 from .generator import Generator
 from .persistence import build_stores
 from .settings import settings
+from .lead_ingest import (
+    load_field_map,
+    normalize_ingest_body,
+    sanitize_idempotency_key,
+    verify_ingest_auth,
+)
+from .scheduler_auth import verify_scheduler_internal_request
 from .social import get_provider
-from .zoho import ZohoClient, map_lead_to_zoho
+from .zoho import ZohoClient, map_lead_to_zoho, zoho_first_row_outcome
 
 
 app = Flask(__name__)
@@ -30,7 +37,12 @@ log = logging.getLogger(__name__)
 
 @app.before_request
 def _log_request():
-    if request.path in ("/healthz", "/readyz"):
+    if (
+        request.path in ("/healthz", "/readyz")
+        or request.path.endswith("/webhook")
+        or "/cron/" in request.path
+        or request.path.endswith("/dispatch")
+    ):
         return None
     log.info(
         "request",
@@ -48,6 +60,65 @@ def _log_request():
 
 def _err(status: int, message: str):
     return jsonify({"error": message}), status
+
+
+def _auto_sync_lead(lead) -> None:
+    if (os.getenv("LEADS_AUTO_SYNC_ZOHO") or "").lower() not in ("1", "true", "yes"):
+        return
+    if not zoho.ready():
+        return
+    if lead.status != "captured":
+        return
+    _push_lead_core(lead.id)
+
+
+def _push_lead_core(lead_id: str) -> dict[str, Any]:
+    l = leads.get(lead_id)
+    if not l:
+        return {"status": "skipped", "reason": "not_found"}
+    if l.status != "captured":
+        return {"status": "skipped", "reason": "not_captured", "lead_status": l.status}
+    payload = map_lead_to_zoho(l)
+    resp = zoho.create_lead(payload)
+    ok, rid, err = zoho_first_row_outcome(resp)
+    if ok:
+        patch: dict[str, Any] = {"zoho_create_response": resp}
+        if rid:
+            patch["zcrm_id"] = rid
+        leads.merge_raw(l.id, patch)
+        leads.set_status(l.id, "pushed")
+        return {"status": "pushed", "zcrm_id": rid, "response": resp}
+    return {"status": "failed", "error": err, "response": resp}
+
+
+def _batch_push_zoho_leads(brand_id: str | None, limit: int) -> dict[str, Any]:
+    captured = leads.list(brand_id=brand_id, status="captured")
+    captured = captured[:limit]
+    pushed = 0
+    failed = 0
+    skipped = 0
+    results: list[dict[str, Any]] = []
+    for l in captured:
+        try:
+            out = _push_lead_core(l.id)
+            st = out.get("status")
+            if st == "pushed":
+                pushed += 1
+            elif st == "failed":
+                failed += 1
+            else:
+                skipped += 1
+            results.append({"lead_id": l.id, **out})
+        except Exception as e:
+            failed += 1
+            results.append({"lead_id": l.id, "status": "failed", "error": str(e)})
+    return {
+        "attempted": len(captured),
+        "pushed": pushed,
+        "failed": failed,
+        "skipped": skipped,
+        "results": results,
+    }
 
 
 @app.get("/healthz")
@@ -73,6 +144,13 @@ def readyz():
         except Exception as e:
             log.exception("readyz")
             return jsonify({"status": "not_ready", "error": str(e)}), 503
+    if (os.getenv("ZOHO_READY_CHECK") or "").lower() in ("1", "true", "yes"):
+        if zoho.ready():
+            try:
+                zoho.ping()
+            except Exception as e:
+                log.exception("readyz")
+                return jsonify({"status": "not_ready", "error": f"zoho: {e}"}), 503
     return jsonify({"status": "ready", "store": settings.store_backend})
 
 
@@ -230,6 +308,8 @@ def cancel_post(post_id: str):
 
 @app.post("/v1/marketing/posts/dispatch")
 def dispatch_posts():
+    if not verify_scheduler_internal_request(request):
+        return _err(401, "unauthorized")
     now_iso = _utcnow().isoformat()
     due = posts.due(now_iso)
     processed = 0
@@ -293,6 +373,8 @@ def capture_lead():
     if not isinstance(raw, dict):
         raw = {"value": raw}
 
+    idem = sanitize_idempotency_key(request.headers.get("Idempotency-Key"))
+
     lead, created = leads.upsert(
         brand_id=brand_id,
         source=source,
@@ -303,7 +385,57 @@ def capture_lead():
         message=str(message) if message is not None else None,
         utm=utm,
         raw=raw,
+        idempotency_key=idem,
     )
+
+    _auto_sync_lead(lead)
+
+    return jsonify({"created": created, "lead": lead.__dict__})
+
+
+@app.post("/v1/marketing/leads/webhook")
+def lead_webhook():
+    if not verify_ingest_auth(request):
+        return _err(401, "unauthorized")
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    body = normalize_ingest_body(body, load_field_map())
+    brand_id = str(body.get("brand_id") or "").strip()
+    source = str(body.get("source") or "webhook").strip()
+    name = body.get("name")
+    email = body.get("email")
+    phone = body.get("phone")
+    company = body.get("company")
+    message = body.get("message")
+    utm = body.get("utm")
+    raw = body.get("raw") if isinstance(body.get("raw"), dict) else body
+
+    if not brand_id or len(brand_id) > 64:
+        return _err(400, "invalid brand_id")
+    if len(source) > 64:
+        return _err(400, "invalid source")
+    if utm is not None and not isinstance(utm, dict):
+        return _err(400, "invalid utm")
+    if not isinstance(raw, dict):
+        raw = {"payload": raw}
+
+    idem = sanitize_idempotency_key(
+        request.headers.get("Idempotency-Key") or (raw.get("idempotency_key") if isinstance(raw, dict) else None)
+    )
+
+    lead, created = leads.upsert(
+        brand_id=brand_id,
+        source=source,
+        name=str(name) if name is not None else None,
+        email=str(email) if email is not None else None,
+        phone=str(phone) if phone is not None else None,
+        company=str(company) if company is not None else None,
+        message=str(message) if message is not None else None,
+        utm=utm,
+        raw=raw,
+        idempotency_key=idem,
+    )
+
+    _auto_sync_lead(lead)
 
     return jsonify({"created": created, "lead": lead.__dict__})
 
@@ -331,6 +463,21 @@ def mark_lead_pushed(lead_id: str):
     return jsonify(l.__dict__)
 
 
+@app.post("/v1/integrations/zoho/push_lead/<lead_id>")
+def push_lead_to_zoho(lead_id: str):
+    if not zoho.ready():
+        return _err(409, "zoho not configured")
+    try:
+        out = _push_lead_core(lead_id)
+    except Exception as e:
+        return jsonify({"lead_id": lead_id, "status": "failed", "error": str(e)}), 502
+    if out.get("status") == "failed":
+        return jsonify({"lead_id": lead_id, **out}), 502
+    if out.get("status") == "skipped":
+        return jsonify({"lead_id": lead_id, **out}), 409
+    return jsonify({"lead_id": lead_id, **out})
+
+
 @app.post("/v1/integrations/zoho/push_leads")
 def push_leads_to_zoho():
     if not zoho.ready():
@@ -343,22 +490,18 @@ def push_leads_to_zoho():
     if limit < 1 or limit > 100:
         return _err(400, "invalid limit")
 
-    captured = leads.list(brand_id=brand_id, status="captured")
-    captured = captured[:limit]
+    return jsonify(_batch_push_zoho_leads(brand_id, limit))
 
-    pushed = 0
-    failed = 0
-    results: list[dict[str, Any]] = []
 
-    for l in captured:
-        try:
-            payload = map_lead_to_zoho(l)
-            resp = zoho.create_lead(payload)
-            leads.set_status(l.id, "pushed")
-            pushed += 1
-            results.append({"lead_id": l.id, "status": "pushed", "response": resp})
-        except Exception as e:
-            failed += 1
-            results.append({"lead_id": l.id, "status": "failed", "error": str(e)})
-
-    return jsonify({"attempted": len(captured), "pushed": pushed, "failed": failed, "results": results})
+@app.post("/v1/cron/zoho_push_leads")
+def zoho_cron_push_leads():
+    if not verify_scheduler_internal_request(request):
+        return _err(401, "unauthorized")
+    if not zoho.ready():
+        return _err(409, "zoho not configured")
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    brand_id = str(body.get("brand_id") or "").strip() or None
+    limit = int(body.get("limit") or os.getenv("ZOHO_CRON_LIMIT") or 50)
+    if limit < 1 or limit > 100:
+        return _err(400, "invalid limit")
+    return jsonify(_batch_push_zoho_leads(brand_id, limit))

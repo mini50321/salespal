@@ -7,6 +7,7 @@ from typing import Any
 
 from google.cloud import firestore
 
+from .lead_ingest import idempotency_doc_id
 from .lead_store import Lead, _norm_email, _norm_phone, _utcnow as _lead_utcnow, make_dedupe_key
 from .post_store import PostJob, _parse_dt, _utcnow as _post_utcnow
 from .settings import Settings
@@ -207,6 +208,7 @@ class FirestoreLeadStore:
         self._db = _fs_client(settings)
         self._leads = self._db.collection(settings.firestore_collection_leads)
         self._dedupe = self._db.collection(settings.firestore_collection_lead_dedupe)
+        self._idem = self._db.collection(settings.firestore_collection_lead_idem)
 
     def upsert(
         self,
@@ -219,13 +221,27 @@ class FirestoreLeadStore:
         message: str | None,
         utm: dict[str, Any] | None,
         raw: dict[str, Any],
+        idempotency_key: str | None = None,
     ) -> tuple[Lead, bool]:
         dedupe_key = make_dedupe_key(brand_id, email, phone)
         leads_col = self._leads
         dedupe_col = self._dedupe
+        idem_col = self._idem
 
         @firestore.transactional
         def _run(transaction) -> tuple[Lead, bool]:
+            if idempotency_key:
+                idref = idem_col.document(idempotency_doc_id(brand_id, idempotency_key))
+                ids = idref.get(transaction=transaction)
+                if ids.exists:
+                    idd = ids.to_dict() or {}
+                    lid = str(idd.get("lead_id") or "")
+                    if lid:
+                        lref = leads_col.document(lid)
+                        ls = lref.get(transaction=transaction)
+                        if ls.exists:
+                            return _lead_from_doc(ls.to_dict() or {}), False
+
             if dedupe_key:
                 iref = dedupe_col.document(dedupe_key)
                 idx = iref.get(transaction=transaction)
@@ -247,6 +263,11 @@ class FirestoreLeadStore:
                             lead.raw = raw or lead.raw
                             lead.updated_at = _lead_utcnow()
                             transaction.set(lref, asdict(lead))
+                            if idempotency_key:
+                                transaction.set(
+                                    idem_col.document(idempotency_doc_id(brand_id, idempotency_key)),
+                                    {"lead_id": lead.id, "brand_id": brand_id},
+                                )
                             return lead, False
 
             lead_id = uuid.uuid4().hex
@@ -270,6 +291,11 @@ class FirestoreLeadStore:
             transaction.set(leads_col.document(lead_id), asdict(lead))
             if dedupe_key:
                 transaction.set(dedupe_col.document(dedupe_key), {"lead_id": lead_id})
+            if idempotency_key:
+                transaction.set(
+                    idem_col.document(idempotency_doc_id(brand_id, idempotency_key)),
+                    {"lead_id": lead_id, "brand_id": brand_id},
+                )
             return lead, True
 
         return _run(self._db.transaction())
@@ -303,6 +329,19 @@ class FirestoreLeadStore:
             return None
         lead = _lead_from_doc(snap.to_dict() or {})
         lead.status = status
+        lead.updated_at = _lead_utcnow()
+        ref.set(asdict(lead))
+        return lead
+
+    def merge_raw(self, lead_id: str, patch: dict[str, Any]) -> Lead | None:
+        ref = self._leads.document(lead_id)
+        snap = ref.get()
+        if not snap.exists:
+            return None
+        lead = _lead_from_doc(snap.to_dict() or {})
+        base = dict(lead.raw) if isinstance(lead.raw, dict) else {}
+        base.update(patch)
+        lead.raw = base
         lead.updated_at = _lead_utcnow()
         ref.set(asdict(lead))
         return lead

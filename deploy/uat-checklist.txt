@@ -1,0 +1,32 @@
+SalesPal Milestone 1 — UAT checklist (run against production URL)
+
+1. Health
+   - GET /healthz returns 200 and JSON status ok.
+   - GET /readyz returns 200 when Firestore (if used) and optional Zoho check pass.
+
+2. Marketing assets (Vertex when GENERATOR_BACKEND=vertex)
+   - POST /v1/marketing/assets with brand_id, asset_type image|carousel|video, prompt.
+   - GET /v1/marketing/assets?brand_id=... lists jobs.
+   - POST approve on a job awaiting_approval when require_approval true.
+
+3. Social dispatch
+   - POST /v1/marketing/posts with approved asset_job_id, provider, channel, caption, scheduled_at in the past or now.
+   - POST /v1/marketing/posts/dispatch with scheduler auth header if SCHEDULER_SECRET is set; expect processed >= 0.
+   - GET /v1/marketing/posts shows posted or failed with provider_post_id when meta_* succeeds.
+
+4. Leads
+   - POST /v1/marketing/leads with brand_id and email or phone.
+   - Repeat with same Idempotency-Key returns created false and same lead id.
+   - POST /v1/marketing/leads/webhook with optional HMAC or secret header when configured.
+
+5. Zoho
+   - POST /v1/integrations/zoho/push_leads with limit or POST /v1/integrations/zoho/push_lead/<id>.
+   - Confirm lead appears in Zoho CRM; lead.raw may contain zcrm_id after push.
+   - POST /v1/cron/zoho_push_leads with X-Scheduler-Secret when scheduler secret is enabled.
+
+6. Custom domain (optional)
+   - Map api.salespal.in (or chosen host) in Cloud Run domain mappings; add DNS records GCP shows; wait for SSL active.
+
+7. Scheduler
+   - Cloud Scheduler job history shows SUCCESS for dispatch and zoho jobs.
+   - If jobs return 401, align SCHEDULER_SECRET on Cloud Run and job headers with deploy/scheduler-jobs.sh.

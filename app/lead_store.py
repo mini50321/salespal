@@ -64,23 +64,33 @@ class LeadStore:
         self.path = path
         self._mem: dict[str, Lead] = {}
         self._index: dict[str, str] = {}
+        self._idem: dict[str, str] = {}
         self._load()
+
+    def _idem_key(self, brand_id: str, idem: str) -> str:
+        return f"{brand_id}|{idem}"
 
     def _load(self) -> None:
         if not os.path.exists(self.path):
             self._mem = {}
             self._index = {}
+            self._idem = {}
             return
         with open(self.path, "r", encoding="utf-8") as f:
             raw = json.load(f)
         self._mem = {k: Lead(**v) for k, v in raw.get("leads", {}).items()}
         self._index = {k: v for k, v in raw.get("index", {}).items()}
+        self._idem = {k: v for k, v in raw.get("idempotency", {}).items() if isinstance(k, str) and isinstance(v, str)}
 
     def _save(self) -> None:
         tmp = f"{self.path}.tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(
-                {"leads": {k: asdict(v) for k, v in self._mem.items()}, "index": self._index},
+                {
+                    "leads": {k: asdict(v) for k, v in self._mem.items()},
+                    "index": self._index,
+                    "idempotency": self._idem,
+                },
                 f,
                 ensure_ascii=False,
             )
@@ -97,7 +107,14 @@ class LeadStore:
         message: str | None,
         utm: dict[str, Any] | None,
         raw: dict[str, Any],
+        idempotency_key: str | None = None,
     ) -> tuple[Lead, bool]:
+        if idempotency_key:
+            ik = self._idem_key(brand_id, idempotency_key)
+            ex_id = self._idem.get(ik)
+            if ex_id and ex_id in self._mem:
+                return self._mem[ex_id], False
+
         dedupe_key = make_dedupe_key(brand_id, email, phone)
         existing_id = self._index.get(dedupe_key) if dedupe_key else None
         if existing_id and existing_id in self._mem:
@@ -112,6 +129,8 @@ class LeadStore:
             lead.raw = raw or lead.raw
             lead.updated_at = _utcnow()
             self._mem[lead.id] = lead
+            if idempotency_key:
+                self._idem[self._idem_key(brand_id, idempotency_key)] = lead.id
             self._save()
             return lead, False
 
@@ -136,8 +155,22 @@ class LeadStore:
         self._mem[lead_id] = lead
         if dedupe_key:
             self._index[dedupe_key] = lead_id
+        if idempotency_key:
+            self._idem[self._idem_key(brand_id, idempotency_key)] = lead_id
         self._save()
         return lead, True
+
+    def merge_raw(self, lead_id: str, patch: dict[str, Any]) -> Lead | None:
+        lead = self._mem.get(lead_id)
+        if not lead:
+            return None
+        base = dict(lead.raw) if isinstance(lead.raw, dict) else {}
+        base.update(patch)
+        lead.raw = base
+        lead.updated_at = _utcnow()
+        self._mem[lead_id] = lead
+        self._save()
+        return lead
 
     def get(self, lead_id: str) -> Lead | None:
         return self._mem.get(lead_id)

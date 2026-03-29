@@ -1,0 +1,9 @@
+Custom domain for Cloud Run (example: api.salespal.in)
+
+1. In Google Cloud Console: Cloud Run → your service → Manage custom domains → Add mapping.
+2. Enter host (e.g. api.salespal.in). Create or select a Domain mapping; note the required DNS records (often A, AAAA, or CNAME to ghs.googlehosted.com).
+3. In GoDaddy or your DNS host, add exactly those records. Do not share registrar login; DNS-only access is enough.
+4. Wait for certificate provisioning (can take up to an hour).
+5. Point the website “Ask AI” or forms at https://api.salespal.in (your host) for API and webhooks.
+
+Scheduler and browser calls must use the same public URL you mapped (HTTPS).
