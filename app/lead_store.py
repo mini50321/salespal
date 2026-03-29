@@ -31,6 +31,16 @@ def _norm_phone(s: str | None) -> str | None:
     return digits
 
 
+def make_dedupe_key(brand_id: str, email: str | None, phone: str | None) -> str | None:
+    e = _norm_email(email)
+    p = _norm_phone(phone)
+    if e:
+        return f"{brand_id}|email|{e}"
+    if p:
+        return f"{brand_id}|phone|{p}"
+    return None
+
+
 @dataclass
 class Lead:
     id: str
@@ -76,15 +86,6 @@ class LeadStore:
             )
         os.replace(tmp, self.path)
 
-    def _make_dedupe_key(self, brand_id: str, email: str | None, phone: str | None) -> str | None:
-        e = _norm_email(email)
-        p = _norm_phone(phone)
-        if e:
-            return f"{brand_id}|email|{e}"
-        if p:
-            return f"{brand_id}|phone|{p}"
-        return None
-
     def upsert(
         self,
         brand_id: str,
@@ -97,7 +98,7 @@ class LeadStore:
         utm: dict[str, Any] | None,
         raw: dict[str, Any],
     ) -> tuple[Lead, bool]:
-        dedupe_key = self._make_dedupe_key(brand_id, email, phone)
+        dedupe_key = make_dedupe_key(brand_id, email, phone)
         existing_id = self._index.get(dedupe_key) if dedupe_key else None
         if existing_id and existing_id in self._mem:
             lead = self._mem[existing_id]

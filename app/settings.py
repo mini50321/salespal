@@ -1,11 +1,21 @@
 from pydantic import BaseModel
 import os
 
+_fs_prefix = ((os.getenv("FIRESTORE_COLLECTION_PREFIX") or "salespal").strip().rstrip("_") or "salespal")
+
 
 class Settings(BaseModel):
     gcp_project_id: str | None = os.getenv("GCP_PROJECT_ID")
     gcp_region: str = os.getenv("GCP_REGION", "asia-south1")
     generator_backend: str = os.getenv("GENERATOR_BACKEND", "mock")
+    store_backend: str = os.getenv("STORE_BACKEND", "json")
+    firestore_database_id: str | None = (os.getenv("FIRESTORE_DATABASE") or "").strip() or None
+    firestore_collection_jobs: str = os.getenv("FIRESTORE_COLLECTION_JOBS") or f"{_fs_prefix}_jobs"
+    firestore_collection_posts: str = os.getenv("FIRESTORE_COLLECTION_POSTS") or f"{_fs_prefix}_posts"
+    firestore_collection_leads: str = os.getenv("FIRESTORE_COLLECTION_LEADS") or f"{_fs_prefix}_leads"
+    firestore_collection_lead_dedupe: str = (
+        os.getenv("FIRESTORE_COLLECTION_LEAD_DEDUPE") or f"{_fs_prefix}_lead_dedupe"
+    )
     job_store_path: str = os.getenv("JOB_STORE_PATH", "job_store.json")
     post_store_path: str = os.getenv("POST_STORE_PATH", "post_store.json")
     lead_store_path: str = os.getenv("LEAD_STORE_PATH", "lead_store.json")

@@ -1,26 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any
 
-
-@dataclass
-class PostResult:
-    provider_post_id: str
-    response: dict[str, Any]
-
-
-class SocialProvider:
-    name: str
-
-    def post(
-        self,
-        channel: str,
-        caption: str,
-        asset_payload: dict[str, Any],
-        brand_id: str,
-    ) -> PostResult:
-        raise NotImplementedError()
+from .social_meta import MetaFacebookProvider, MetaInstagramProvider
+from .social_types import PostResult, SocialProvider
 
 
 class MockProvider(SocialProvider):
@@ -40,7 +23,11 @@ class MockProvider(SocialProvider):
 
 
 def get_provider(provider_name: str) -> SocialProvider:
-    if provider_name == "mock":
+    n = (provider_name or "").strip().lower()
+    if n == "mock":
         return MockProvider()
+    if n == "meta_facebook":
+        return MetaFacebookProvider()
+    if n == "meta_instagram":
+        return MetaInstagramProvider()
     raise ValueError("unsupported provider")
-

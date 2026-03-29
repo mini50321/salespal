@@ -21,6 +21,40 @@ def _mock_png_base64() -> str:
     return base64.b64encode(raw).decode("ascii")
 
 
+def _image_gen_kwargs() -> dict[str, Any]:
+    kw: dict[str, Any] = {}
+    ar = (os.getenv("VERTEX_IMAGE_ASPECT_RATIO") or "").strip()
+    if ar:
+        kw["aspect_ratio"] = ar
+    neg = (os.getenv("VERTEX_IMAGE_NEGATIVE_PROMPT") or "").strip()
+    if neg:
+        kw["negative_prompt"] = neg
+    lang = (os.getenv("VERTEX_IMAGE_LANGUAGE") or "").strip()
+    if lang:
+        kw["language"] = lang
+    gs = (os.getenv("VERTEX_IMAGE_GUIDANCE_SCALE") or "").strip()
+    if gs:
+        try:
+            kw["guidance_scale"] = float(gs)
+        except ValueError:
+            pass
+    gcs = (os.getenv("VERTEX_IMAGE_OUTPUT_GCS_URI") or "").strip()
+    if gcs:
+        kw["output_gcs_uri"] = gcs
+    sf = (os.getenv("VERTEX_IMAGE_SAFETY_FILTER_LEVEL") or "").strip()
+    if sf:
+        kw["safety_filter_level"] = sf
+    pg = (os.getenv("VERTEX_IMAGE_PERSON_GENERATION") or "").strip()
+    if pg:
+        kw["person_generation"] = pg
+    wm = (os.getenv("VERTEX_IMAGE_ADD_WATERMARK") or "").strip().lower()
+    if wm in ("0", "false", "no"):
+        kw["add_watermark"] = False
+    elif wm in ("1", "true", "yes"):
+        kw["add_watermark"] = True
+    return kw
+
+
 class Generator:
     def generate(self, asset_type: str, prompt: str, n: int) -> GeneratedAsset:
         if settings.generator_backend == "vertex":
@@ -29,7 +63,10 @@ class Generator:
 
     def _generate_mock(self, asset_type: str, prompt: str, n: int) -> GeneratedAsset:
         if asset_type == "video":
-            return GeneratedAsset(asset_type="video", payload={"status": "not_ready", "prompt": prompt})
+            return GeneratedAsset(
+                asset_type="video",
+                payload={"prompt": prompt, "model": "mock", "videos": [], "status": "mock"},
+            )
         if asset_type == "carousel":
             return GeneratedAsset(
                 asset_type="carousel",
@@ -43,19 +80,17 @@ class Generator:
         if not project:
             raise RuntimeError("GCP_PROJECT_ID is required for vertex backend")
 
-        import vertexai
-
-        vertexai.init(project=project, location=region)
-
         if asset_type in ("image", "carousel"):
+            import vertexai
+
+            vertexai.init(project=project, location=region)
             from vertexai.preview.vision_models import ImageGenerationModel
 
             model_name = os.getenv("VERTEX_IMAGE_MODEL", "imagegeneration@006")
             model = ImageGenerationModel.from_pretrained(model_name)
-            out = model.generate_images(
-                prompt=prompt,
-                number_of_images=max(1, n if asset_type == "carousel" else 1),
-            )
+            num = max(1, n if asset_type == "carousel" else 1)
+            img_kw = _image_gen_kwargs()
+            out = model.generate_images(prompt=prompt, number_of_images=num, **img_kw)
             imgs = []
             for img in out.images:
                 b = img._image_bytes
@@ -65,6 +100,19 @@ class Generator:
             return GeneratedAsset(asset_type="image", payload={"image_base64": imgs[0], "prompt": prompt})
 
         if asset_type == "video":
-            return GeneratedAsset(asset_type="video", payload={"status": "not_ready", "prompt": prompt})
+            from .vertex_video import generate_videos_veo
+
+            vid_region = (os.getenv("VERTEX_VIDEO_REGION") or region or "").strip()
+            if not vid_region:
+                raise RuntimeError("GCP_REGION or VERTEX_VIDEO_REGION is required for veo")
+            model_name = (os.getenv("VERTEX_VIDEO_MODEL") or "veo-3.0-fast-generate-001").strip()
+            payload = generate_videos_veo(
+                project_id=project,
+                location=vid_region,
+                model_id=model_name,
+                prompt=prompt,
+                sample_count=n,
+            )
+            return GeneratedAsset(asset_type="video", payload=payload)
 
         raise ValueError("invalid asset_type")

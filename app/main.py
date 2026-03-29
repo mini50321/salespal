@@ -1,24 +1,49 @@
 from __future__ import annotations
 
+import logging
+import os
+
+from .logging_config import configure_logging
+from .gcp_bootstrap import maybe_load_secrets
+
+configure_logging()
+maybe_load_secrets()
+
 from flask import Flask, jsonify, request
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .generator import Generator
+from .persistence import build_stores
 from .settings import settings
-from .store import JobStore
-from .post_store import PostStore
 from .social import get_provider
-from .lead_store import LeadStore
 from .zoho import ZohoClient, map_lead_to_zoho
 
 
 app = Flask(__name__)
-store = JobStore(settings.job_store_path)
-posts = PostStore(settings.post_store_path)
-leads = LeadStore(settings.lead_store_path)
+store, posts, leads = build_stores(settings)
 gen = Generator()
 zoho = ZohoClient()
+
+log = logging.getLogger(__name__)
+
+
+@app.before_request
+def _log_request():
+    if request.path in ("/healthz", "/readyz"):
+        return None
+    log.info(
+        "request",
+        extra={
+            "gcp_extra": {
+                "httpRequest": {
+                    "requestMethod": request.method,
+                    "requestUrl": request.path,
+                }
+            }
+        },
+    )
+    return None
 
 
 def _err(status: int, message: str):
@@ -27,7 +52,28 @@ def _err(status: int, message: str):
 
 @app.get("/healthz")
 def healthz():
-    return jsonify({"status": "ok"})
+    return jsonify(
+        {
+            "status": "ok",
+            "service": os.getenv("K_SERVICE"),
+            "revision": os.getenv("K_REVISION"),
+            "configuration": os.getenv("K_CONFIGURATION"),
+        }
+    )
+
+
+@app.get("/readyz")
+def readyz():
+    b = (settings.store_backend or "json").strip().lower()
+    if b == "firestore":
+        try:
+            from .firestore_stores import firestore_ready_check
+
+            firestore_ready_check(settings)
+        except Exception as e:
+            log.exception("readyz")
+            return jsonify({"status": "not_ready", "error": str(e)}), 503
+    return jsonify({"status": "ready", "store": settings.store_backend})
 
 
 @app.post("/v1/marketing/assets")

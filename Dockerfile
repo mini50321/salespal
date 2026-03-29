@@ -9,4 +9,4 @@ COPY app /app/app
 
 ENV PORT=8080
 
-CMD ["gunicorn", "-b", "0.0.0.0:8080", "app.main:app"]
+CMD exec gunicorn --bind 0.0.0.0:${PORT} --workers 1 --threads 8 --timeout 120 app.main:app
