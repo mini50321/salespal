@@ -9,8 +9,10 @@ SCHEDULER_SECRET="${SCHEDULER_SECRET:?set SCHEDULER_SECRET same as Cloud Run env
 
 DISPATCH_SCHEDULE="${DISPATCH_SCHEDULE:-*/5 * * * *}"
 ZOHO_CRON_SCHEDULE="${ZOHO_CRON_SCHEDULE:-*/10 * * * *}"
+WA_OUTREACH_SCHEDULE="${WA_OUTREACH_SCHEDULE:-*/15 * * * *}"
 DISPATCH_JOB="${DISPATCH_JOB:-salespal-dispatch-posts}"
 ZOHO_JOB="${ZOHO_JOB:-salespal-cron-zoho-push}"
+WA_OUTREACH_JOB="${WA_OUTREACH_JOB:-salespal-cron-whatsapp-outreach}"
 
 gcloud config set project "${PROJECT_ID}"
 
@@ -36,4 +38,15 @@ gcloud scheduler jobs create http "${ZOHO_JOB}" \
   --attempt-deadline=540s \
   --time-zone="${CRON_TZ:-UTC}"
 
-echo "Created jobs ${DISPATCH_JOB} and ${ZOHO_JOB}. Ensure Cloud Run has SCHEDULER_SECRET or DISPATCH_SECRET set to the same value."
+gcloud scheduler jobs delete "${WA_OUTREACH_JOB}" --location="${SCHEDULER_LOCATION}" --quiet 2>/dev/null || true
+gcloud scheduler jobs create http "${WA_OUTREACH_JOB}" \
+  --location="${SCHEDULER_LOCATION}" \
+  --schedule="${WA_OUTREACH_SCHEDULE}" \
+  --uri="${SERVICE_URL}/v1/cron/whatsapp_outreach" \
+  --http-method=POST \
+  --headers="Content-Type=application/json,X-Scheduler-Secret=${SCHEDULER_SECRET}" \
+  --message-body="{\"limit\":25}" \
+  --attempt-deadline=540s \
+  --time-zone="${CRON_TZ:-UTC}"
+
+echo "Created jobs ${DISPATCH_JOB}, ${ZOHO_JOB}, and ${WA_OUTREACH_JOB}. Ensure Cloud Run has SCHEDULER_SECRET or DISPATCH_SECRET set to the same value."

@@ -7,8 +7,10 @@ $SchedLoc = if ($env:SCHEDULER_LOCATION) { $env:SCHEDULER_LOCATION } else { $Reg
 $Tz = if ($env:CRON_TZ) { $env:CRON_TZ } else { "UTC" }
 $DispSched = if ($env:DISPATCH_SCHEDULE) { $env:DISPATCH_SCHEDULE } else { "*/5 * * * *" }
 $ZohoSched = if ($env:ZOHO_CRON_SCHEDULE) { $env:ZOHO_CRON_SCHEDULE } else { "*/10 * * * *" }
+$WaSched = if ($env:WA_OUTREACH_SCHEDULE) { $env:WA_OUTREACH_SCHEDULE } else { "*/15 * * * *" }
 $DispJob = if ($env:DISPATCH_JOB) { $env:DISPATCH_JOB } else { "salespal-dispatch-posts" }
 $ZohoJob = if ($env:ZOHO_JOB) { $env:ZOHO_JOB } else { "salespal-cron-zoho-push" }
+$WaJob = if ($env:WA_OUTREACH_JOB) { $env:WA_OUTREACH_JOB } else { "salespal-cron-whatsapp-outreach" }
 
 gcloud config set project $env:PROJECT_ID
 
@@ -31,6 +33,17 @@ gcloud scheduler jobs create http $ZohoJob `
   --http-method=POST `
   --headers="Content-Type=application/json,X-Scheduler-Secret=$($env:SCHEDULER_SECRET)" `
   --message-body='{"limit":50}' `
+  --attempt-deadline=540s `
+  --time-zone=$Tz
+
+gcloud scheduler jobs delete $WaJob --location=$SchedLoc --quiet 2>$null
+gcloud scheduler jobs create http $WaJob `
+  --location=$SchedLoc `
+  --schedule=$WaSched `
+  --uri="$($env:SERVICE_URL)/v1/cron/whatsapp_outreach" `
+  --http-method=POST `
+  --headers="Content-Type=application/json,X-Scheduler-Secret=$($env:SCHEDULER_SECRET)" `
+  --message-body='{"limit":25}' `
   --attempt-deadline=540s `
   --time-zone=$Tz
 

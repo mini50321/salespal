@@ -21,6 +21,47 @@ def _zoho_default_fields() -> dict[str, Any]:
     return d if isinstance(d, dict) else {}
 
 
+def _qualification_field_map() -> dict[str, str]:
+    """Maps local keys budget/location/timeline to Zoho Leads API field names (incl. custom __c)."""
+    raw = (os.getenv("ZOHO_QUALIFICATION_MAP_JSON") or "").strip()
+    if not raw:
+        return {}
+    try:
+        d = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(d, dict):
+        return {}
+    out: dict[str, str] = {}
+    for k in ("budget", "location", "timeline"):
+        v = d.get(k)
+        if isinstance(v, str) and v.strip():
+            out[k] = v.strip()
+    return out
+
+
+def build_qualification_update_payload(qual: dict[str, Any]) -> dict[str, Any]:
+    """
+    Build CRM field updates from qualification dict (see conversation_to_qualification_dict).
+    Non-empty when ZOHO_QUALIFICATION_MAP_JSON and/or ZOHO_QUALIFIED_LEAD_STATUS is set.
+    """
+    if not qual.get("complete"):
+        return {}
+    fields: dict[str, Any] = {}
+    fmap = _qualification_field_map()
+    for slot in ("budget", "location", "timeline"):
+        zkey = fmap.get(slot)
+        val = qual.get(slot)
+        if zkey and val is not None:
+            s = str(val).strip()
+            if s:
+                fields[zkey] = s
+    st = (os.getenv("ZOHO_QUALIFIED_LEAD_STATUS") or "").strip()
+    if st:
+        fields["Lead_Status"] = st
+    return fields
+
+
 def zoho_first_row_outcome(resp: dict[str, Any]) -> tuple[bool, str | None, str | None]:
     data = resp.get("data")
     if not isinstance(data, list) or not data:
@@ -130,6 +171,18 @@ class ZohoClient:
         resp = requests.post(url, json={"data": [lead_payload]}, headers=self._headers(), timeout=30)
         if resp.status_code >= 400:
             raise RuntimeError(f"zoho create lead error: {resp.status_code} {resp.text}")
+        return resp.json()
+
+    def update_lead(self, record_id: str, fields: dict[str, Any]) -> dict[str, Any]:
+        rid = (record_id or "").strip()
+        if not rid:
+            raise ValueError("zoho lead record_id required")
+        if not fields:
+            raise ValueError("zoho lead update fields required")
+        url = f"{_api_base()}/crm/v2/Leads/{rid}"
+        resp = requests.put(url, json={"data": [fields]}, headers=self._headers(), timeout=30)
+        if resp.status_code >= 400:
+            raise RuntimeError(f"zoho update.lead error: {resp.status_code} {resp.text}")
         return resp.json()
 
 

@@ -34,6 +34,8 @@ class Settings(BaseModel):
     zoho_client_secret: str | None = os.getenv("ZOHO_CLIENT_SECRET")
     zoho_refresh_token: str | None = os.getenv("ZOHO_REFRESH_TOKEN")
     zoho_owner_id: str | None = os.getenv("ZOHO_OWNER_ID")
+    # rules = static templates; vertex = Gemini paraphrase (same B/L/T state machine)
+    conversation_reply_backend: str = os.getenv("CONVERSATION_REPLY_BACKEND", "rules")
 
 
 settings = Settings()

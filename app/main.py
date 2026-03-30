@@ -33,7 +33,15 @@ from .whatsapp_cloud import (
     verify_signature as whatsapp_verify_signature,
     verify_subscription as whatsapp_verify_subscription,
 )
-from .zoho import ZohoClient, map_lead_to_zoho, zoho_first_row_outcome
+from .whatsapp_outreach import batch_whatsapp_outreach, outreach_one_lead
+from .conversation_store import Conversation
+from .zoho import (
+    ZohoClient,
+    build_qualification_update_payload,
+    map_lead_to_zoho,
+    zoho_first_row_outcome,
+)
+from . import public_chat as public_chat_api
 
 
 app = Flask(__name__)
@@ -45,6 +53,13 @@ zoho = ZohoClient()
 log = logging.getLogger(__name__)
 
 
+@app.after_request
+def _public_chat_cors(resp):
+    for k, v in public_chat_api.cors_header_items(request).items():
+        resp.headers[k] = v
+    return resp
+
+
 @app.before_request
 def _log_request():
     if (
@@ -52,6 +67,7 @@ def _log_request():
         or request.path.endswith("/webhook")
         or "/webhooks/" in request.path
         or "/cron/" in request.path
+        or request.path.startswith("/v1/public/chat")
         or request.path.endswith("/dispatch")
     ):
         return None
@@ -100,6 +116,60 @@ def _push_lead_core(lead_id: str) -> dict[str, Any]:
         leads.set_status(l.id, "pushed")
         return {"status": "pushed", "zcrm_id": rid, "response": resp}
     return {"status": "failed", "error": err, "response": resp}
+
+
+def _sync_qualification_to_zoho(lead_id: str, conv: Conversation) -> None:
+    """When B/L/T qualification completes, update the Zoho Lead (pipeline / custom fields)."""
+    if conv.state != "complete":
+        return
+    if (os.getenv("ZOHO_SYNC_QUALIFICATION") or "1").lower() in ("0", "false", "no"):
+        return
+    if not zoho.ready():
+        return
+    qual = conversation_to_qualification_dict(conv)
+    payload = build_qualification_update_payload(qual)
+    if not payload:
+        return
+    lead = leads.get(lead_id)
+    if not lead:
+        return
+    raw = lead.raw if isinstance(lead.raw, dict) else {}
+    if raw.get("qualification_synced_for_conv") == conv.id:
+        return
+    zcrm_id = str(raw.get("zcrm_id") or "").strip()
+    if not zcrm_id:
+        if lead.status == "captured":
+            try:
+                out = _push_lead_core(lead_id)
+            except Exception:
+                log.exception("zoho push before qualification update")
+                return
+            if out.get("status") != "pushed":
+                log.warning("qualification zoho sync: could not create lead first: %s", out)
+                return
+            lead = leads.get(lead_id)
+            if not lead:
+                return
+            raw = lead.raw if isinstance(lead.raw, dict) else {}
+            zcrm_id = str(raw.get("zcrm_id") or "").strip()
+        if not zcrm_id:
+            log.warning("qualification zoho sync: missing zcrm_id for lead %s", lead_id)
+            return
+    try:
+        resp = zoho.update_lead(zcrm_id, payload)
+        ok, _, err = zoho_first_row_outcome(resp)
+        if ok:
+            leads.merge_raw(
+                lead_id,
+                {
+                    "qualification_synced_for_conv": conv.id,
+                    "zoho_qualification_synced_at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+        else:
+            log.warning("qualification zoho update failed: %s", err)
+    except Exception:
+        log.exception("qualification zoho update")
 
 
 def _batch_push_zoho_leads(brand_id: str | None, limit: int) -> dict[str, Any]:
@@ -534,6 +604,7 @@ def post_conversation_message(cid: str):
         return _err(404, "not found")
     conv2, reply = process_user_message(conv, str(text))
     conversations.update(conv2)
+    _sync_qualification_to_zoho(conv2.lead_id, conv2)
     return jsonify(
         {
             "conversation": conv2.__dict__,
@@ -541,6 +612,52 @@ def post_conversation_message(cid: str):
             "qualification": conversation_to_qualification_dict(conv2),
         }
     )
+
+
+@app.route("/v1/public/chat/start", methods=["POST", "OPTIONS"])
+def public_chat_start():
+    if request.method == "OPTIONS":
+        return Response("", 204)
+    if not public_chat_api.is_enabled():
+        return _err(404, "not found")
+    if not public_chat_api.verify_api_key(request):
+        return _err(401, "unauthorized")
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    payload, code = public_chat_api.start_session(
+        leads,
+        conversations,
+        body,
+        auto_sync_lead=_auto_sync_lead,
+    )
+    if code >= 400:
+        return jsonify(payload), code
+    return jsonify(payload)
+
+
+@app.route("/v1/public/chat/message", methods=["POST", "OPTIONS"])
+def public_chat_message():
+    if request.method == "OPTIONS":
+        return Response("", 204)
+    if not public_chat_api.is_enabled():
+        return _err(404, "not found")
+    if not public_chat_api.verify_api_key(request):
+        return _err(401, "unauthorized")
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    cid = str(body.get("conversation_id") or "").strip()
+    text = body.get("text")
+    if not cid:
+        return _err(400, "conversation_id required")
+    if text is None or str(text).strip() == "":
+        return _err(400, "text required")
+    payload, code = public_chat_api.post_message(
+        conversations,
+        cid,
+        str(text),
+        sync_qualification_to_zoho=_sync_qualification_to_zoho,
+    )
+    if code >= 400:
+        return jsonify(payload), code
+    return jsonify(payload)
 
 
 def _handle_whatsapp_message_item(item: dict[str, str]) -> None:
@@ -601,6 +718,7 @@ def _handle_whatsapp_message_item(item: dict[str, str]) -> None:
             whatsapp_send_text(wa_from, opening)
     conv_out, reply = process_user_message(conv, text)
     conversations.update(conv_out)
+    _sync_qualification_to_zoho(lead.id, conv_out)
     whatsapp_send_text(wa_from, reply)
     if mid:
         leads.merge_raw(lead.id, {"last_processed_wa_id": mid})
@@ -694,3 +812,76 @@ def zoho_cron_push_leads():
     if limit < 1 or limit > 100:
         return _err(400, "invalid limit")
     return jsonify(_batch_push_zoho_leads(brand_id, limit))
+
+
+def _whatsapp_send_configured() -> bool:
+    return bool(
+        (os.getenv("WHATSAPP_PHONE_NUMBER_ID") or "").strip()
+        and (os.getenv("WHATSAPP_ACCESS_TOKEN") or "").strip()
+    )
+
+
+@app.post("/v1/integrations/whatsapp/outreach_lead/<lead_id>")
+def integrations_whatsapp_outreach_lead(lead_id: str):
+    if not _whatsapp_send_configured():
+        return _err(409, "whatsapp send not configured")
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    ignore = bool(body.get("ignore_outreach_marker"))
+    out = outreach_one_lead(
+        leads,
+        conversations,
+        lead_id,
+        auto_sync_lead=_auto_sync_lead,
+        ignore_outreach_marker=ignore,
+    )
+    if out.get("status") == "failed":
+        return jsonify(out), 502
+    return jsonify(out)
+
+
+@app.post("/v1/integrations/whatsapp/outreach_leads")
+def integrations_whatsapp_outreach_leads():
+    if not _whatsapp_send_configured():
+        return _err(409, "whatsapp send not configured")
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    brand_id = str(body.get("brand_id") or "").strip() or None
+    limit = int(body.get("limit") or 25)
+    ignore = bool(body.get("ignore_outreach_marker"))
+    if limit < 1 or limit > 200:
+        return _err(400, "invalid limit")
+    batch = batch_whatsapp_outreach(
+        leads,
+        conversations,
+        brand_id=brand_id,
+        limit=limit,
+        auto_sync_lead=_auto_sync_lead,
+        ignore_outreach_marker=ignore,
+    )
+    if batch.get("error"):
+        return _err(400, str(batch["error"]))
+    return jsonify(batch)
+
+
+@app.post("/v1/cron/whatsapp_outreach")
+def cron_whatsapp_outreach():
+    if not verify_scheduler_internal_request(request):
+        return _err(401, "unauthorized")
+    if not _whatsapp_send_configured():
+        return _err(409, "whatsapp send not configured")
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    brand_id = str(body.get("brand_id") or "").strip() or None
+    limit = int(body.get("limit") or os.getenv("WHATSAPP_OUTREACH_CRON_LIMIT") or 25)
+    ignore = bool(body.get("ignore_outreach_marker"))
+    if limit < 1 or limit > 200:
+        return _err(400, "invalid limit")
+    batch = batch_whatsapp_outreach(
+        leads,
+        conversations,
+        brand_id=brand_id,
+        limit=limit,
+        auto_sync_lead=_auto_sync_lead,
+        ignore_outreach_marker=ignore,
+    )
+    if batch.get("error"):
+        return _err(400, str(batch["error"]))
+    return jsonify(batch)

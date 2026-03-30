@@ -96,5 +96,52 @@ def send_text(to_wa_id: str, text: str) -> dict[str, Any]:
     return j if isinstance(j, dict) else {"data": j}
 
 
+def send_template(
+    to_wa_id: str,
+    template_name: str,
+    language_code: str,
+    body_parameters: list[str] | None = None,
+) -> dict[str, Any]:
+    """
+    Send an approved WhatsApp Business template (required for cold outreach outside the 24h window).
+    body_parameters: positional {{1}}, {{2}}, ... for the template BODY component.
+    """
+    pnid = (os.getenv("WHATSAPP_PHONE_NUMBER_ID") or "").strip()
+    token = (os.getenv("WHATSAPP_ACCESS_TOKEN") or "").strip()
+    ver = (os.getenv("WHATSAPP_GRAPH_VERSION") or "v21.0").strip().strip("/")
+    if not pnid or not token:
+        raise RuntimeError("WHATSAPP_PHONE_NUMBER_ID and WHATSAPP_ACCESS_TOKEN are required to send")
+    to = "".join(c for c in str(to_wa_id) if c.isdigit())
+    if not to:
+        raise ValueError("invalid whatsapp to id")
+    name = (template_name or "").strip()
+    if not name:
+        raise ValueError("template name required")
+    lang = (language_code or "en").strip() or "en"
+    tmpl: dict[str, Any] = {"name": name, "language": {"code": lang}}
+    if body_parameters:
+        tmpl["components"] = [
+            {
+                "type": "body",
+                "parameters": [{"type": "text", "text": str(p)[:1024]} for p in body_parameters],
+            }
+        ]
+    body: dict[str, Any] = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "template",
+        "template": tmpl,
+    }
+    url = f"https://graph.facebook.com/{ver}/{pnid}/messages"
+    r = requests.post(url, json=body, headers={"Authorization": f"Bearer {token}"}, timeout=60)
+    try:
+        j = r.json()
+    except Exception:
+        j = {"raw": r.text}
+    if r.status_code >= 400:
+        raise RuntimeError(f"whatsapp template send failed {r.status_code}: {j}")
+    return j if isinstance(j, dict) else {"data": j}
+
+
 def default_locale() -> str:
     return (os.getenv("WHATSAPP_DEFAULT_LOCALE") or "en").strip().lower()[:8] or "en"

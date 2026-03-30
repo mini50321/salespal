@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .conversation_store import Conversation
+from .settings import settings
 
 
 MESSAGES: dict[str, dict[str, str]] = {
@@ -44,9 +45,43 @@ def _t(locale: str, key: str) -> str:
     return pack.get(key) or MESSAGES["en"][key]
 
 
+def _polish_reply(
+    *,
+    locale: str,
+    template_reply: str,
+    user_message: str | None,
+    conversation_state: str,
+    filled_slots: dict[str, Any],
+) -> str:
+    if (settings.conversation_reply_backend or "rules").strip().lower() != "vertex":
+        return template_reply
+    try:
+        from .vertex_chat import polish_assistant_reply
+
+        out = polish_assistant_reply(
+            locale=locale,
+            template_reply=template_reply,
+            user_message=user_message,
+            conversation_state=conversation_state,
+            filled_slots=filled_slots,
+        )
+        if out and out.strip():
+            return out.strip()
+    except Exception:
+        pass
+    return template_reply
+
+
 def opening_turn(locale: str, channel: str) -> dict[str, Any]:
     lc = locale if locale in MESSAGES else "en"
     text = f"{_t(lc, 'welcome')} {_t(lc, 'ask_budget')}"
+    text = _polish_reply(
+        locale=lc,
+        template_reply=text,
+        user_message=None,
+        conversation_state="ask_budget",
+        filled_slots={},
+    )
     return {
         "state": "ask_budget",
         "turn": {"role": "assistant", "content": text, "channel": channel},
@@ -55,13 +90,29 @@ def opening_turn(locale: str, channel: str) -> dict[str, Any]:
 
 def process_user_message(conv: Conversation, text: str) -> tuple[Conversation, str]:
     msg = (text or "").strip()
-    if not msg:
-        return conv, _t(conv.locale, "ask_budget") if conv.state != "complete" else _t(conv.locale, "already_done")
-
     lc = conv.locale if conv.locale in MESSAGES else "en"
 
+    if not msg:
+        reply = _t(conv.locale, "ask_budget") if conv.state != "complete" else _t(conv.locale, "already_done")
+        reply = _polish_reply(
+            locale=lc,
+            template_reply=reply,
+            user_message=None,
+            conversation_state=conv.state,
+            filled_slots=dict(conv.slots),
+        )
+        return conv, reply
+
     if conv.state == "complete":
-        return conv, _t(lc, "already_done")
+        reply = _t(lc, "already_done")
+        reply = _polish_reply(
+            locale=lc,
+            template_reply=reply,
+            user_message=msg,
+            conversation_state=conv.state,
+            filled_slots=dict(conv.slots),
+        )
+        return conv, reply
 
     turns = list(conv.turns)
     ts_u = datetime.now(timezone.utc).isoformat()
@@ -69,7 +120,13 @@ def process_user_message(conv: Conversation, text: str) -> tuple[Conversation, s
 
     if conv.state == "ask_budget":
         if _is_greeting(msg):
-            reply = _t(lc, "budget_clarify")
+            reply = _polish_reply(
+                locale=lc,
+                template_reply=_t(lc, "budget_clarify"),
+                user_message=msg,
+                conversation_state="ask_budget",
+                filled_slots=dict(conv.slots),
+            )
             ts_a = datetime.now(timezone.utc).isoformat()
             turns.append({"role": "assistant", "content": reply, "channel": conv.channel, "created_at": ts_a})
             conv.turns = turns
@@ -77,20 +134,44 @@ def process_user_message(conv: Conversation, text: str) -> tuple[Conversation, s
         conv.slots = dict(conv.slots)
         conv.slots["budget"] = msg
         conv.state = "ask_location"
-        reply = _t(lc, "ask_location")
+        reply = _polish_reply(
+            locale=lc,
+            template_reply=_t(lc, "ask_location"),
+            user_message=msg,
+            conversation_state=conv.state,
+            filled_slots=dict(conv.slots),
+        )
     elif conv.state == "ask_location":
         conv.slots = dict(conv.slots)
         conv.slots["location"] = msg
         conv.state = "ask_timeline"
-        reply = _t(lc, "ask_timeline")
+        reply = _polish_reply(
+            locale=lc,
+            template_reply=_t(lc, "ask_timeline"),
+            user_message=msg,
+            conversation_state=conv.state,
+            filled_slots=dict(conv.slots),
+        )
     elif conv.state == "ask_timeline":
         conv.slots = dict(conv.slots)
         conv.slots["timeline"] = msg
         conv.state = "complete"
-        reply = _t(lc, "done")
+        reply = _polish_reply(
+            locale=lc,
+            template_reply=_t(lc, "done"),
+            user_message=msg,
+            conversation_state=conv.state,
+            filled_slots=dict(conv.slots),
+        )
     else:
         conv.state = "ask_budget"
-        reply = _t(lc, "ask_budget")
+        reply = _polish_reply(
+            locale=lc,
+            template_reply=_t(lc, "ask_budget"),
+            user_message=msg,
+            conversation_state=conv.state,
+            filled_slots=dict(conv.slots),
+        )
 
     ts_a = datetime.now(timezone.utc).isoformat()
     turns.append({"role": "assistant", "content": reply, "channel": conv.channel, "created_at": ts_a})
