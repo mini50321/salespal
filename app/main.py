@@ -9,12 +9,13 @@ from .gcp_bootstrap import maybe_load_secrets
 configure_logging()
 maybe_load_secrets()
 
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, request
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .generator import Generator
-from .persistence import build_stores
+from .conversation_engine import conversation_to_qualification_dict, process_user_message
+from .persistence import build_conversation_store, build_stores
 from .settings import settings
 from .lead_ingest import (
     load_field_map,
@@ -24,11 +25,20 @@ from .lead_ingest import (
 )
 from .scheduler_auth import verify_scheduler_internal_request
 from .social import get_provider
+from .whatsapp_cloud import (
+    default_locale,
+    iter_inbound_text_messages,
+    resolve_brand_id,
+    send_text as whatsapp_send_text,
+    verify_signature as whatsapp_verify_signature,
+    verify_subscription as whatsapp_verify_subscription,
+)
 from .zoho import ZohoClient, map_lead_to_zoho, zoho_first_row_outcome
 
 
 app = Flask(__name__)
 store, posts, leads = build_stores(settings)
+conversations = build_conversation_store(settings)
 gen = Generator()
 zoho = ZohoClient()
 
@@ -40,6 +50,7 @@ def _log_request():
     if (
         request.path in ("/healthz", "/readyz")
         or request.path.endswith("/webhook")
+        or "/webhooks/" in request.path
         or "/cron/" in request.path
         or request.path.endswith("/dispatch")
     ):
@@ -445,6 +456,184 @@ def list_leads():
     brand_id = request.args.get("brand_id")
     status = request.args.get("status")
     return jsonify([l.__dict__ for l in leads.list(brand_id=brand_id, status=status)])
+
+
+@app.post("/v1/conversations")
+def create_conversation():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    lead_id = str(body.get("lead_id") or "").strip()
+    brand_id = str(body.get("brand_id") or "").strip()
+    channel = str(body.get("channel") or "web").strip()
+    locale = body.get("locale")
+    metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else None
+    require_lead = bool(body.get("require_lead", True))
+
+    if not lead_id or not brand_id or len(brand_id) > 64:
+        return _err(400, "invalid lead_id or brand_id")
+    if require_lead:
+        ld = leads.get(lead_id)
+        if not ld or ld.brand_id != brand_id:
+            return _err(404, "lead not found for brand")
+
+    conv = conversations.create(
+        lead_id=lead_id,
+        brand_id=brand_id,
+        channel=channel,
+        locale=str(locale) if locale is not None else None,
+        metadata=metadata,
+    )
+    return jsonify(
+        {
+            "conversation": conv.__dict__,
+            "assistant_reply": conv.turns[-1].get("content") if conv.turns else "",
+            "qualification": conversation_to_qualification_dict(conv),
+        }
+    )
+
+
+@app.get("/v1/conversations/<cid>")
+def get_conversation(cid: str):
+    conv = conversations.get(cid)
+    if not conv:
+        return _err(404, "not found")
+    return jsonify(
+        {"conversation": conv.__dict__, "qualification": conversation_to_qualification_dict(conv)}
+    )
+
+
+@app.get("/v1/conversations/<cid>/qualification")
+def get_conversation_qualification(cid: str):
+    conv = conversations.get(cid)
+    if not conv:
+        return _err(404, "not found")
+    return jsonify(conversation_to_qualification_dict(conv))
+
+
+@app.get("/v1/conversations")
+def list_conversation_for_lead():
+    lead_id = (request.args.get("lead_id") or "").strip()
+    brand_id = (request.args.get("brand_id") or "").strip()
+    if not lead_id or not brand_id:
+        return _err(400, "lead_id and brand_id required")
+    conv = conversations.get_latest_for_lead(brand_id, lead_id)
+    if not conv:
+        return _err(404, "not found")
+    return jsonify(
+        {"conversation": conv.__dict__, "qualification": conversation_to_qualification_dict(conv)}
+    )
+
+
+@app.post("/v1/conversations/<cid>/messages")
+def post_conversation_message(cid: str):
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    text = body.get("text")
+    if text is None or str(text).strip() == "":
+        return _err(400, "text required")
+    conv = conversations.get(cid)
+    if not conv:
+        return _err(404, "not found")
+    conv2, reply = process_user_message(conv, str(text))
+    conversations.update(conv2)
+    return jsonify(
+        {
+            "conversation": conv2.__dict__,
+            "assistant_reply": reply,
+            "qualification": conversation_to_qualification_dict(conv2),
+        }
+    )
+
+
+def _handle_whatsapp_message_item(item: dict[str, str]) -> None:
+    wa_from = item["wa_from"]
+    text = item["body"]
+    pnid = item["phone_number_id"]
+    mid = item.get("message_id") or ""
+    brand_id = resolve_brand_id(pnid)
+    if not brand_id:
+        raise RuntimeError(
+            "set WHATSAPP_DEFAULT_BRAND_ID or WHATSAPP_NUMBER_BRAND_MAP for this phone_number_id"
+        )
+    loc = default_locale()
+    lead = leads.find_by_brand_and_phone(brand_id, wa_from)
+    if not lead:
+        lead, _ = leads.upsert(
+            brand_id=brand_id,
+            source="whatsapp",
+            name=None,
+            email=None,
+            phone=wa_from,
+            company=None,
+            message=text[:2000],
+            utm=None,
+            raw={"wa_id": wa_from, "last_wa_message_id": mid},
+            idempotency_key=None,
+        )
+    lead = leads.get(lead.id)
+    if not lead:
+        return
+    if mid and (lead.raw or {}).get("last_processed_wa_id") == mid:
+        return
+    leads.merge_raw(
+        lead.id,
+        {
+            "wa_id": wa_from,
+            "last_wa_message_id": mid,
+            "last_wa_body_preview": text[:240],
+        },
+    )
+    lead = leads.get(lead.id)
+    if not lead:
+        return
+    _auto_sync_lead(lead)
+    conv = conversations.get_latest_for_lead(brand_id, lead.id)
+    if conv is None or conv.state == "complete":
+        conv = conversations.create(
+            lead_id=lead.id,
+            brand_id=brand_id,
+            channel="whatsapp",
+            locale=loc,
+            metadata={"wa_id": wa_from},
+        )
+        opening = ""
+        if conv.turns:
+            opening = str(conv.turns[-1].get("content") or "")
+        if opening:
+            whatsapp_send_text(wa_from, opening)
+    conv_out, reply = process_user_message(conv, text)
+    conversations.update(conv_out)
+    whatsapp_send_text(wa_from, reply)
+    if mid:
+        leads.merge_raw(lead.id, {"last_processed_wa_id": mid})
+
+
+@app.route("/v1/webhooks/whatsapp", methods=["GET", "POST"])
+def whatsapp_webhook():
+    if request.method == "GET":
+        exp = (os.getenv("WHATSAPP_VERIFY_TOKEN") or "").strip()
+        ch = whatsapp_verify_subscription(
+            request.args.get("hub.mode"),
+            request.args.get("hub.verify_token"),
+            request.args.get("hub.challenge"),
+            exp,
+        )
+        if ch is None:
+            return "Forbidden", 403
+        return Response(ch, mimetype="text/plain")
+    raw = request.get_data()
+    sec = (os.getenv("WHATSAPP_APP_SECRET") or "").strip()
+    if sec:
+        if not whatsapp_verify_signature(raw, request.headers.get("X-Hub-Signature-256"), sec):
+            return _err(401, "invalid signature")
+    payload = request.get_json(force=True, silent=True) or {}
+    items = iter_inbound_text_messages(payload)
+    errs: list[str] = []
+    for it in items:
+        try:
+            _handle_whatsapp_message_item(it)
+        except Exception as e:
+            log.exception("whatsapp")
+            errs.append(str(e))
+    return jsonify({"received": True, "processed": len(items), "errors": errs})
 
 
 @app.get("/v1/marketing/leads/<lead_id>")

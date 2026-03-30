@@ -22,3 +22,14 @@ def build_stores(settings: Settings):
         PostStore(settings.post_store_path),
         LeadStore(settings.lead_store_path),
     )
+
+
+def build_conversation_store(settings: Settings):
+    b = (settings.store_backend or "json").strip().lower()
+    if b == "firestore":
+        from .firestore_stores import FirestoreConversationStore
+
+        return FirestoreConversationStore(settings)
+    from .conversation_store import JsonConversationStore
+
+    return JsonConversationStore(settings.conversation_store_path)

@@ -175,6 +175,15 @@ class LeadStore:
     def get(self, lead_id: str) -> Lead | None:
         return self._mem.get(lead_id)
 
+    def find_by_brand_and_phone(self, brand_id: str, phone: str | None) -> Lead | None:
+        p = _norm_phone(phone)
+        if not p:
+            return None
+        for lead in self._mem.values():
+            if lead.brand_id == brand_id and lead.phone == p:
+                return lead
+        return None
+
     def list(self, brand_id: str | None = None, status: str | None = None) -> list[Lead]:
         leads = list(self._mem.values())
         if brand_id:

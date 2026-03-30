@@ -19,6 +19,13 @@ class Settings(BaseModel):
     firestore_collection_lead_idem: str = (
         os.getenv("FIRESTORE_COLLECTION_LEAD_IDEM") or f"{_fs_prefix}_lead_idem"
     )
+    firestore_collection_conversations: str = (
+        os.getenv("FIRESTORE_COLLECTION_CONVERSATIONS") or f"{_fs_prefix}_conversations"
+    )
+    firestore_collection_conv_latest: str = (
+        os.getenv("FIRESTORE_COLLECTION_CONV_LATEST") or f"{_fs_prefix}_conv_latest"
+    )
+    conversation_store_path: str = os.getenv("CONVERSATION_STORE_PATH", "conversation_store.json")
     job_store_path: str = os.getenv("JOB_STORE_PATH", "job_store.json")
     post_store_path: str = os.getenv("POST_STORE_PATH", "post_store.json")
     lead_store_path: str = os.getenv("LEAD_STORE_PATH", "lead_store.json")

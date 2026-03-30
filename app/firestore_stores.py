@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from datetime import datetime, timezone
+import hashlib
 import uuid
 from typing import Any
 
 from google.cloud import firestore
 
+from .conversation_store import Conversation, _norm_locale as _conv_norm_locale
 from .lead_ingest import idempotency_doc_id
 from .lead_store import Lead, _norm_email, _norm_phone, _utcnow as _lead_utcnow, make_dedupe_key
 from .post_store import PostJob, _parse_dt, _utcnow as _post_utcnow
@@ -309,6 +311,19 @@ class FirestoreLeadStore:
             return None
         return _lead_from_doc(d)
 
+    def find_by_brand_and_phone(self, brand_id: str, phone: str | None) -> Lead | None:
+        p = _norm_phone(phone)
+        if not p:
+            return None
+        for doc in self._leads.where("brand_id", "==", brand_id).stream():
+            d = doc.to_dict()
+            if not d:
+                continue
+            lead = _lead_from_doc(d)
+            if lead.phone == p:
+                return lead
+        return None
+
     def list(self, brand_id: str | None = None, status: str | None = None) -> list[Lead]:
         if brand_id is not None:
             stream = self._leads.where("brand_id", "==", brand_id).stream()
@@ -345,6 +360,104 @@ class FirestoreLeadStore:
         lead.updated_at = _lead_utcnow()
         ref.set(asdict(lead))
         return lead
+
+
+def _conv_doc_to_model(d: dict[str, Any]) -> Conversation:
+    return Conversation(
+        id=d["id"],
+        lead_id=d["lead_id"],
+        brand_id=d["brand_id"],
+        channel=d["channel"],
+        locale=d["locale"],
+        state=d["state"],
+        slots=d.get("slots") or {},
+        turns=list(d.get("turns") or []),
+        metadata=d.get("metadata") or {},
+        created_at=d["created_at"],
+        updated_at=d["updated_at"],
+    )
+
+
+def _conv_latest_id(brand_id: str, lead_id: str) -> str:
+    return hashlib.sha256(f"{brand_id}\n{lead_id}".encode()).hexdigest()
+
+
+class FirestoreConversationStore:
+    def __init__(self, settings: Settings):
+        self._db = _fs_client(settings)
+        self._col = self._db.collection(settings.firestore_collection_conversations)
+        self._latest = self._db.collection(settings.firestore_collection_conv_latest)
+        self._max_turns = 120
+
+    def create(
+        self,
+        lead_id: str,
+        brand_id: str,
+        channel: str,
+        locale: str | None,
+        metadata: dict[str, Any] | None,
+    ) -> Conversation:
+        lc = _conv_norm_locale(locale)
+        ch = (channel or "web").strip().lower()
+        if ch not in ("web", "whatsapp", "voice", "sms", "email", "rcs"):
+            ch = "web"
+        cid = uuid.uuid4().hex
+        now = _job_utcnow()
+        from .conversation_engine import opening_turn
+
+        ot = opening_turn(lc, ch)
+        t0 = dict(ot["turn"])
+        t0["created_at"] = now
+        conv = Conversation(
+            id=cid,
+            lead_id=lead_id,
+            brand_id=brand_id,
+            channel=ch,
+            locale=lc,
+            state=ot["state"],
+            slots={},
+            turns=[t0],
+            metadata=dict(metadata) if isinstance(metadata, dict) else {},
+            created_at=now,
+            updated_at=now,
+        )
+        self._col.document(cid).set(asdict(conv))
+        self._latest.document(_conv_latest_id(brand_id, lead_id)).set(
+            {"conversation_id": cid, "brand_id": brand_id, "lead_id": lead_id, "updated_at": now}
+        )
+        return conv
+
+    def get(self, conversation_id: str) -> Conversation | None:
+        snap = self._col.document(conversation_id).get()
+        if not snap.exists:
+            return None
+        d = snap.to_dict()
+        if not d:
+            return None
+        return _conv_doc_to_model(d)
+
+    def get_latest_for_lead(self, brand_id: str, lead_id: str) -> Conversation | None:
+        snap = self._latest.document(_conv_latest_id(brand_id, lead_id)).get()
+        if not snap.exists:
+            return None
+        cid = (snap.to_dict() or {}).get("conversation_id")
+        if not cid:
+            return None
+        return self.get(str(cid))
+
+    def update(self, conv: Conversation) -> None:
+        conv.updated_at = _job_utcnow()
+        if len(conv.turns) > self._max_turns:
+            conv.turns = conv.turns[-self._max_turns :]
+        self._col.document(conv.id).set(asdict(conv))
+        self._latest.document(_conv_latest_id(conv.brand_id, conv.lead_id)).set(
+            {
+                "conversation_id": conv.id,
+                "brand_id": conv.brand_id,
+                "lead_id": conv.lead_id,
+                "updated_at": conv.updated_at,
+            }
+        )
 
 
 def firestore_ready_check(settings: Settings) -> None:
