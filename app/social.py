@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from .social_linkedin import LinkedInProvider
 from .social_meta import MetaFacebookProvider, MetaInstagramProvider
 from .social_types import PostResult, SocialProvider
 
@@ -30,4 +31,6 @@ def get_provider(provider_name: str) -> SocialProvider:
         return MetaFacebookProvider()
     if n == "meta_instagram":
         return MetaInstagramProvider()
+    if n == "linkedin":
+        return LinkedInProvider()
     raise ValueError("unsupported provider")
