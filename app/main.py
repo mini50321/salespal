@@ -53,6 +53,23 @@ zoho = ZohoClient()
 log = logging.getLogger(__name__)
 
 
+@app.get("/")
+def index():
+    return jsonify(
+        {
+            "service": "salespal-api",
+            "status": "ok",
+            "routes": {
+                "healthz": "/healthz",
+                "readyz": "/readyz",
+                "whatsapp_webhook": "/v1/webhooks/whatsapp",
+                "public_chat_start": "/v1/public/chat/start",
+                "public_chat_message": "/v1/public/chat/message",
+            },
+        }
+    )
+
+
 @app.after_request
 def _public_chat_cors(resp):
     for k, v in public_chat_api.cors_header_items(request).items():
@@ -212,6 +229,11 @@ def healthz():
             "configuration": os.getenv("K_CONFIGURATION"),
         }
     )
+
+
+@app.get("/_healthz")
+def healthz_alias():
+    return healthz()
 
 
 @app.get("/readyz")

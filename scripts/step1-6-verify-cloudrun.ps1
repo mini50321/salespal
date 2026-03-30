@@ -4,7 +4,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$health = Invoke-RestMethod -Method Get -Uri ($Url.TrimEnd("/") + "/healthz")
+$health = Invoke-RestMethod -Method Get -Uri ($Url.TrimEnd("/") + "/_healthz")
 if ($health.status -ne "ok") { throw "health failed" }
 
 $assets = Invoke-RestMethod -Method Get -Uri ($Url.TrimEnd("/") + "/v1/marketing/assets")
