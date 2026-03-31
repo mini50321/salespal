@@ -355,7 +355,50 @@ A
 ok waiting
 This platform does not allow external contact. I was told my account was restricted a few days ago after I made an external contact.
 Please share sir GCP access permissions, Zoho API, WhatsApp API, Tata API, and domain access permissions
-======
+March 27, 2026
 
-M^@#ur45zf5W$!J
-neJSgFT1MfQcxXTN
+User avatar
+SAIaim2win@#$
+mountttech@gmail.com
+for Google Vertex Platform
+image.png
+image.png
+tata api token: eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiI3NDEzOTUiLCJjciI6ZmFsc2UsIm lzcyI6Imh0dHBzOi8vY2xvdWRwaG9uZS50YXRhdGVsZXNlcnZpY2VzLmNvbS90b2tlbi9nZW5lcm F0ZSIsImlhdCI6MTc3NDUxMDM3OSwiZXhwIjoyMDc0NTEwMzc5LCJuYmYiOjE3NzQ1MTAzNzksIm p0aSI6Ik5WZnFEOTI5SnFWZzhqMTQifQ.hDfSHtw_RoGDYFTp-OmqQ9ZaO9qYWSHxk2lwqlFmWZ8
+tata clcik to call support api: 5bac2c4b-d07f-4dc0-9573-a19f987e9a7f
+domain access permissions, let us know when you need sme
+Hey, for the domain setup of— I won't be able to give direct GoDaddy access as it's a shared account with multiple domains. Please share the exact DNS records you need to add/update (record type, name, value, TTL) and I'll update them on my end within minutes. Thanks!
+User avatar
+work started?
+kindly reply
+Hi, sir.
+The work has already started. The internet in our area was operating unstably, but it has now been restored. We were unable to contact you due to the internet issue.
+Today
+
+Sir can check the results at ""
+User avatar
+OK
+[2:17 PM, 3/28/2026] +91 93225 58893: Hi
+[2:17 PM, 3/28/2026] m_star2050: Hi.
+[2:17 PM, 3/28/2026] m_star2050: I am gilsaydith.
+[2:17 PM, 3/28/2026] m_star2050: https://github.com/mini50321/salespal
+[2:18 PM, 3/28/2026] m_star2050: Sir can check my work results here every day.
+[2:30 PM, 3/28/2026] m_star2050: To complete Milestone 1, the following information is required.
+Which social apps should I post to?
+Login/access permissions for those apps?
+Google Cloud: Please provide the project name, billing method, and distribution permissions.
+Zoho CRM: Please specify the connection method and the fields to save for each lead.
+Lead: How are leads collected? Please send an example of data.
+[9:09 PM, 3/28/2026] +91 93225 58893: Sir can check my work results here every day.
+Sure but request you to post daily what milestone have been achieved
+[9:09 PM, 3/28/2026] +91 93225 58893: Google cloud I have already given you credential kindly check in chat
+[9:10 PM, 3/28/2026] +91 93225 58893: We have SalesPal marketing, so it will be collected from marketing platform like social media platform meta Google LinkedIn X etc
+[12:02 PM, 3/30/2026] m_star2050: Hi, sir.
+[12:02 PM, 3/30/2026] m_star2050: Milestone 1 has already been implemented in software and is suitable for the Google Cloud environment.
+
+Vertex assets, meta posting, lead capture, Zoho push notifications, and scheduled sending features are all connected.
+
+To complete the milestone, final environment variable settings, domain deployment, and User Acceptance Test (UAT) approval are required.
+[12:03 PM, 3/30/2026] m_star2050: I was unable to work on the project development over the weekend as I spent time with my family. I will begin working on it starting today.
+[12:04 PM, 3/30/2026] m_star2050: sorry, sir.
+[1:51 PM, 3/30/2026] +91 93225 58893: It's ok but i need demo of milestone one
+======

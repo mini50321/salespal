@@ -85,7 +85,7 @@ gcloud run deploy $ServiceName `
   --region $Region `
   --image $image `
   --service-account $sa `
-  --set-env-vars ($env -join ",") `
+  --update-env-vars ($env -join ",") `
   --port 8080 `
   --min-instances 0 `
   --max-instances 10 `

@@ -106,6 +106,504 @@ def _err(status: int, message: str):
     return jsonify({"error": message}), status
 
 
+def _demo_ui_enabled() -> bool:
+    return (os.getenv("DEMO_UI_ENABLED") or "").lower() in ("1", "true", "yes")
+
+
+def _demo_ui_authorized() -> bool:
+    # If DEMO_UI_KEY is set, require it via query (?key=) or header (X-Demo-Key).
+    expected = (os.getenv("DEMO_UI_KEY") or "").strip()
+    if not expected:
+        return True
+    got = (request.args.get("key") or request.headers.get("X-Demo-Key") or "").strip()
+    return bool(got) and got == expected
+
+
+@app.get("/demo")
+def demo_ui():
+    if not _demo_ui_enabled():
+        return _err(404, "not found")
+    if not _demo_ui_authorized():
+        return _err(401, "unauthorized")
+
+    html = """<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SalesPal — Milestone 1 · Demo console</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700&display=swap" rel="stylesheet" />
+    <style>
+      :root {
+        --bg: #eef2f6;
+        --surface: #ffffff;
+        --text: #0f172a;
+        --muted: #64748b;
+        --border: #e2e8f0;
+        --accent: #0c4a6e;
+        --accent-light: #0284c7;
+        --success: #047857;
+        --radius: 14px;
+        --shadow: 0 1px 2px rgba(15, 23, 42, 0.05), 0 12px 40px rgba(15, 23, 42, 0.08);
+        --font: "DM Sans", system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: var(--font);
+        color: var(--text);
+        background: var(--bg);
+        min-height: 100vh;
+        line-height: 1.5;
+      }
+      .topbar {
+        background: linear-gradient(135deg, #0c4a6e 0%, #082f49 45%, #0e7490 100%);
+        color: #f8fafc;
+        padding: 0 1.5rem;
+        border-bottom: 1px solid rgba(255,255,255,0.12);
+      }
+      .topbar-inner {
+        max-width: 1180px;
+        margin: 0 auto;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 1rem;
+        min-height: 4rem;
+        flex-wrap: wrap;
+      }
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 0.875rem;
+      }
+      .brand-mark {
+        width: 40px; height: 40px;
+        border-radius: 10px;
+        background: rgba(255,255,255,0.15);
+        display: grid;
+        place-items: center;
+        font-weight: 700;
+        font-size: 0.95rem;
+        letter-spacing: -0.02em;
+      }
+      .brand h1 {
+        margin: 0;
+        font-size: 1.125rem;
+        font-weight: 600;
+        letter-spacing: -0.02em;
+      }
+      .brand p {
+        margin: 0;
+        font-size: 0.8125rem;
+        opacity: 0.85;
+        font-weight: 400;
+      }
+      .badge {
+        font-size: 0.6875rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        padding: 0.35rem 0.65rem;
+        border-radius: 999px;
+        background: rgba(255,255,255,0.18);
+        border: 1px solid rgba(255,255,255,0.25);
+        white-space: nowrap;
+      }
+      .shell {
+        max-width: 1180px;
+        margin: 0 auto;
+        padding: 1.75rem 1.5rem 3rem;
+      }
+      .hero {
+        margin-bottom: 1.5rem;
+      }
+      .hero h2 {
+        margin: 0 0 0.35rem;
+        font-size: 1.375rem;
+        font-weight: 600;
+        letter-spacing: -0.02em;
+      }
+      .hero p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 0.9375rem;
+        max-width: 52rem;
+      }
+      .layout {
+        display: grid;
+        grid-template-columns: 1fr minmax(280px, 380px);
+        gap: 1.5rem;
+        align-items: start;
+      }
+      @media (max-width: 960px) {
+        .layout { grid-template-columns: 1fr; }
+        .panel-out { position: static !important; }
+      }
+      .card {
+        background: var(--surface);
+        border-radius: var(--radius);
+        border: 1px solid var(--border);
+        box-shadow: var(--shadow);
+        padding: 1.25rem 1.35rem;
+        margin-bottom: 1.25rem;
+      }
+      .card:last-child { margin-bottom: 0; }
+      .card-h {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 0.75rem;
+        margin-bottom: 1rem;
+      }
+      .card-h h3 {
+        margin: 0;
+        font-size: 1rem;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+      }
+      .card-h span {
+        font-size: 0.75rem;
+        color: var(--muted);
+        font-weight: 500;
+      }
+      label {
+        display: block;
+        font-size: 0.6875rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: var(--muted);
+        margin: 0.75rem 0 0.35rem;
+      }
+      label:first-of-type { margin-top: 0; }
+      input, textarea, select {
+        width: 100%;
+        padding: 0.65rem 0.85rem;
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        font: inherit;
+        font-size: 0.9375rem;
+        color: var(--text);
+        background: #fff;
+        transition: border-color 0.15s, box-shadow 0.15s;
+      }
+      input:focus, textarea:focus, select:focus {
+        outline: none;
+        border-color: var(--accent-light);
+        box-shadow: 0 0 0 3px rgba(2, 132, 199, 0.15);
+      }
+      textarea { min-height: 88px; resize: vertical; }
+      .row2 {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 0.875rem;
+      }
+      @media (max-width: 520px) { .row2 { grid-template-columns: 1fr; } }
+      .btn-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.5rem;
+        margin-top: 1rem;
+      }
+      button {
+        font-family: inherit;
+        font-size: 0.875rem;
+        font-weight: 600;
+        padding: 0.55rem 1rem;
+        border-radius: 10px;
+        cursor: pointer;
+        border: none;
+        transition: transform 0.08s, opacity 0.15s, box-shadow 0.15s;
+      }
+      button:active { transform: scale(0.98); }
+      button:disabled { opacity: 0.55; cursor: not-allowed; transform: none; }
+      .btn-primary {
+        background: linear-gradient(180deg, #0369a1 0%, var(--accent) 100%);
+        color: #fff;
+        box-shadow: 0 2px 8px rgba(12, 74, 110, 0.28);
+      }
+      .btn-primary:hover:not(:disabled) {
+        box-shadow: 0 4px 14px rgba(12, 74, 110, 0.35);
+      }
+      .btn-secondary {
+        background: var(--surface);
+        color: var(--text);
+        border: 1px solid var(--border);
+      }
+      .btn-secondary:hover:not(:disabled) {
+        background: #f8fafc;
+      }
+      .hint {
+        font-size: 0.75rem;
+        color: var(--muted);
+        margin: 0.65rem 0 0;
+      }
+      .hint code {
+        font-size: 0.7rem;
+        background: #f1f5f9;
+        padding: 0.12rem 0.35rem;
+        border-radius: 4px;
+      }
+      .panel-out {
+        position: sticky;
+        top: 1rem;
+      }
+      .panel-out .card {
+        min-height: 320px;
+        display: flex;
+        flex-direction: column;
+      }
+      pre#out {
+        flex: 1;
+        margin: 0;
+        margin-top: 0.75rem;
+        white-space: pre-wrap;
+        word-break: break-word;
+        background: #0f172a;
+        color: #e2e8f0;
+        padding: 1rem;
+        border-radius: 10px;
+        font-size: 0.78rem;
+        line-height: 1.45;
+        overflow: auto;
+        max-height: min(58vh, 520px);
+        font-family: ui-monospace, "Cascadia Code", "SF Mono", Menlo, monospace;
+      }
+      .footer {
+        margin-top: 2rem;
+        text-align: center;
+        font-size: 0.75rem;
+        color: var(--muted);
+      }
+      .status-line {
+        font-size: 0.8125rem;
+        color: var(--muted);
+        min-height: 1.25rem;
+      }
+    </style>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="topbar-inner">
+        <div class="brand">
+          <div class="brand-mark">SP</div>
+          <div>
+            <h1>SalesPal</h1>
+            <p>Milestone 1 · Marketing &amp; lead pipeline demo</p>
+          </div>
+        </div>
+        <span class="badge">Internal UAT console</span>
+      </div>
+    </header>
+
+    <div class="shell">
+      <div class="hero">
+        <h2>Live API demo</h2>
+        <p>
+          Use this console to validate Cloud Run deployment, Firestore lead capture, Zoho CRM push, and Vertex-backed asset generation —
+          in one place for stakeholder review.
+        </p>
+      </div>
+
+      <div class="layout">
+        <div class="main-col">
+          <div class="card">
+            <div class="card-h">
+              <div>
+                <h3>System status</h3>
+                <span>Health &amp; readiness probes</span>
+              </div>
+            </div>
+            <div class="btn-row">
+              <button type="button" class="btn-secondary" id="btn-health" onclick="runHealth()">Check health</button>
+              <button type="button" class="btn-secondary" id="btn-ready" onclick="runReady()">Check database ready</button>
+            </div>
+            <p class="hint">Calls <code>GET /_healthz</code> and <code>GET /readyz</code>.</p>
+            <div class="status-line" id="status-hint"></div>
+          </div>
+
+          <div class="card">
+            <div class="card-h">
+              <div>
+                <h3>Lead capture</h3>
+                <span>Marketing ingestion · Firestore</span>
+              </div>
+            </div>
+            <div class="row2">
+              <div>
+                <label for="lead_brand">Brand ID</label>
+                <input id="lead_brand" value="demo" autocomplete="off" />
+              </div>
+              <div>
+                <label for="lead_source">Source</label>
+                <input id="lead_source" value="demo_ui" autocomplete="off" />
+              </div>
+            </div>
+            <div class="row2">
+              <div>
+                <label for="lead_name">Name</label>
+                <input id="lead_name" value="Test Lead" autocomplete="name" />
+              </div>
+              <div>
+                <label for="lead_phone">Phone</label>
+                <input id="lead_phone" value="9999999999" autocomplete="tel" />
+              </div>
+            </div>
+            <label for="lead_message">Message</label>
+            <textarea id="lead_message">Interested in SalesPal demo</textarea>
+            <div class="btn-row">
+              <button type="button" class="btn-primary" id="btn-lead" onclick="createLead()">Create lead</button>
+              <button type="button" class="btn-secondary" id="btn-list" onclick="listLeads()">List leads</button>
+            </div>
+            <label for="last_lead_id">Last lead ID</label>
+            <input id="last_lead_id" placeholder="Populated after create" autocomplete="off" />
+            <div class="btn-row">
+              <button type="button" class="btn-primary" id="btn-zoho" onclick="pushZoho()">Push to Zoho CRM</button>
+            </div>
+            <p class="hint">Zoho requires OAuth credentials on Cloud Run. Errors appear in the response panel.</p>
+          </div>
+
+          <div class="card">
+            <div class="card-h">
+              <div>
+                <h3>Vertex marketing asset</h3>
+                <span>Image · carousel · video</span>
+              </div>
+            </div>
+            <div class="row2">
+              <div>
+                <label for="asset_type">Asset type</label>
+                <select id="asset_type">
+                  <option value="image" selected>Image</option>
+                  <option value="carousel">Carousel</option>
+                  <option value="video">Video</option>
+                </select>
+              </div>
+              <div>
+                <label for="asset_n">Count (n)</label>
+                <input id="asset_n" value="1" inputmode="numeric" />
+              </div>
+            </div>
+            <label for="asset_prompt">Prompt</label>
+            <textarea id="asset_prompt">Create a premium B2B marketing visual for SalesPal 360 (India, enterprise tone).</textarea>
+            <div class="btn-row">
+              <button type="button" class="btn-primary" id="btn-asset" onclick="createAsset()">Generate asset</button>
+            </div>
+            <p class="hint">Set <code>GENERATOR_BACKEND=vertex</code> on Cloud Run for live Vertex output; otherwise responses are mock.</p>
+          </div>
+        </div>
+
+        <aside class="panel-out">
+          <div class="card">
+            <div class="card-h">
+              <div>
+                <h3>API response</h3>
+                <span>Latest result</span>
+              </div>
+            </div>
+            <p class="hint" style="margin:0">JSON from the backend. Share this panel during screen recordings.</p>
+            <pre id="out">Select an action to view the response.</pre>
+          </div>
+        </aside>
+      </div>
+
+      <p class="footer">
+        SalesPal demo console — not for production end users. Configure secrets only via GCP / Secret Manager.
+      </p>
+    </div>
+
+    <script>
+      const outEl = document.getElementById('out');
+      const hintEl = document.getElementById('status-hint');
+      function show(obj) {
+        outEl.textContent = (typeof obj === 'string') ? obj : JSON.stringify(obj, null, 2);
+      }
+      function setBusy(id, busy) {
+        const el = document.getElementById(id);
+        if (el) el.disabled = !!busy;
+      }
+      async function callGet(path) {
+        hintEl.textContent = 'Requesting ' + path + '…';
+        const r = await fetch(path, { method: 'GET' });
+        const t = await r.text();
+        hintEl.textContent = r.ok ? 'OK · HTTP ' + r.status : 'Error · HTTP ' + r.status;
+        try { show(JSON.parse(t)); } catch { show(t); }
+      }
+      function runHealth() { setBusy('btn-health', true); callGet('/_healthz').finally(() => setBusy('btn-health', false)); }
+      function runReady() { setBusy('btn-ready', true); callGet('/readyz').finally(() => setBusy('btn-ready', false)); }
+      async function callJson(path, body) {
+        const r = await fetch(path, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        const t = await r.text();
+        let data;
+        try { data = JSON.parse(t); } catch { data = { raw: t }; }
+        if (!r.ok) data._http = { status: r.status };
+        hintEl.textContent = r.ok ? 'OK · HTTP ' + r.status : 'Error · HTTP ' + r.status;
+        return data;
+      }
+      async function createLead() {
+        setBusy('btn-lead', true);
+        try {
+        const body = {
+          brand_id: document.getElementById('lead_brand').value.trim(),
+          source: document.getElementById('lead_source').value.trim(),
+          name: document.getElementById('lead_name').value.trim(),
+          phone: document.getElementById('lead_phone').value.trim(),
+          message: document.getElementById('lead_message').value,
+          raw: { demo_ui: true },
+        };
+        const data = await callJson('/v1/marketing/leads', body);
+        show(data);
+        const id = data && data.lead && data.lead.id ? String(data.lead.id) : '';
+        if (id) document.getElementById('last_lead_id').value = id;
+        } finally { setBusy('btn-lead', false); }
+      }
+      async function listLeads() {
+        setBusy('btn-list', true);
+        hintEl.textContent = 'Loading leads…';
+        try {
+        const brand = document.getElementById('lead_brand').value.trim();
+        const r = await fetch('/v1/marketing/leads?brand_id=' + encodeURIComponent(brand), { method: 'GET' });
+        const t = await r.text();
+        hintEl.textContent = r.ok ? 'OK · HTTP ' + r.status : 'Error · HTTP ' + r.status;
+        try { show(JSON.parse(t)); } catch { show(t); }
+        } finally { setBusy('btn-list', false); }
+      }
+      async function pushZoho() {
+        const id = document.getElementById('last_lead_id').value.trim();
+        if (!id) { show('Create a lead first, then push to Zoho.'); hintEl.textContent = ''; return; }
+        setBusy('btn-zoho', true);
+        try {
+        const data = await callJson('/v1/integrations/zoho/push_lead/' + encodeURIComponent(id), {});
+        show(data);
+        } finally { setBusy('btn-zoho', false); }
+      }
+      async function createAsset() {
+        setBusy('btn-asset', true);
+        try {
+        const body = {
+          brand_id: document.getElementById('lead_brand').value.trim(),
+          asset_type: document.getElementById('asset_type').value,
+          prompt: document.getElementById('asset_prompt').value,
+          n: parseInt(document.getElementById('asset_n').value || '1', 10),
+          require_approval: false,
+        };
+        const data = await callJson('/v1/marketing/assets', body);
+        show(data);
+        } finally { setBusy('btn-asset', false); }
+      }
+    </script>
+  </body>
+</html>"""
+    return Response(html, mimetype="text/html; charset=utf-8")
+
+
 def _auto_sync_lead(lead) -> None:
     if (os.getenv("LEADS_AUTO_SYNC_ZOHO") or "").lower() not in ("1", "true", "yes"):
         return
