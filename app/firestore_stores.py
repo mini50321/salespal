@@ -2,11 +2,17 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from datetime import datetime, timezone
+import base64 as b64mod
 import hashlib
+import json
+import logging
+import os
 import uuid
 from typing import Any
 
 from google.cloud import firestore
+
+log = logging.getLogger(__name__)
 
 from .conversation_store import Conversation, _norm_locale as _conv_norm_locale
 from .lead_ingest import idempotency_doc_id
@@ -24,6 +30,131 @@ def _fs_client(settings: Settings) -> firestore.Client:
     if db_id and db_id.lower() != "(default)":
         return firestore.Client(project=project, database=db_id)
     return firestore.Client(project=project)
+
+
+def _payload_json_size(payload: dict[str, Any]) -> int:
+    return len(json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8"))
+
+
+def _upload_image_b64_to_gcs(blob_b64: str, bucket_name: str, object_prefix: str = "salespal-assets") -> str:
+    from google.cloud import storage
+
+    raw = b64mod.b64decode(str(blob_b64).strip())
+    if len(raw) >= 8 and raw[:8] == b"\x89PNG\r\n\x1a\n":
+        ct, ext = "image/png", "png"
+    elif len(raw) >= 3 and raw[:3] == b"\xff\xd8\xff":
+        ct, ext = "image/jpeg", "jpg"
+    else:
+        ct, ext = "application/octet-stream", "bin"
+    name = f"{object_prefix}/{uuid.uuid4().hex}.{ext}"
+    client = storage.Client()
+    blob = client.bucket(bucket_name).blob(name)
+    blob.upload_from_string(raw, content_type=ct)
+    return f"gs://{bucket_name}/{name}"
+
+
+def _upload_video_b64_to_gcs(
+    blob_b64: str,
+    bucket_name: str,
+    object_prefix: str = "salespal-assets",
+    mime_type: str = "video/mp4",
+) -> str:
+    from google.cloud import storage
+
+    raw = b64mod.b64decode(str(blob_b64).strip())
+    mt = (mime_type or "video/mp4").strip().lower()
+    if "mp4" in mt:
+        ct, ext = "video/mp4", "mp4"
+    elif "quicktime" in mt or "mov" in mt:
+        ct, ext = "video/quicktime", "mov"
+    elif "webm" in mt:
+        ct, ext = "video/webm", "webm"
+    else:
+        ct, ext = (mime_type or "video/mp4").strip() or "video/mp4", "mp4"
+    name = f"{object_prefix}/{uuid.uuid4().hex}.{ext}"
+    client = storage.Client()
+    blob = client.bucket(bucket_name).blob(name)
+    blob.upload_from_string(raw, content_type=ct)
+    return f"gs://{bucket_name}/{name}"
+
+
+def _offload_media_fields_to_gcs(bucket_name: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Upload embedded base64 / video blobs to GCS; replace with *gcs_uri fields."""
+    trimmed = dict(payload)
+    if trimmed.get("image_base64"):
+        uri = _upload_image_b64_to_gcs(str(trimmed["image_base64"]), bucket_name)
+        del trimmed["image_base64"]
+        trimmed["image_gcs_uri"] = uri
+    imgs = trimmed.get("images_base64")
+    if isinstance(imgs, list) and imgs:
+        uris: list[str] = []
+        for item in imgs:
+            if isinstance(item, str) and item.strip():
+                uris.append(_upload_image_b64_to_gcs(item, bucket_name))
+        del trimmed["images_base64"]
+        trimmed["images_gcs_uris"] = uris
+
+    vids = trimmed.get("videos")
+    if isinstance(vids, list) and vids:
+        new_vids: list[dict[str, Any]] = []
+        for v in vids:
+            if not isinstance(v, dict):
+                continue
+            out_v: dict[str, Any] = {}
+            mt = str(v.get("mime_type") or "video/mp4")
+            out_v["mime_type"] = mt
+            gcs = str(v.get("gcs_uri") or "").strip()
+            b64 = v.get("bytes_base64")
+            if gcs:
+                out_v["gcs_uri"] = gcs
+            elif isinstance(b64, str) and b64.strip():
+                out_v["gcs_uri"] = _upload_video_b64_to_gcs(b64, bucket_name, mime_type=mt)
+            new_vids.append(out_v)
+        trimmed["videos"] = new_vids
+    return trimmed
+
+
+def prepare_asset_output_for_firestore(settings: Settings, payload: dict[str, Any]) -> dict[str, Any]:
+    """Keep job documents under Firestore's ~1 MiB limit; upload media to GCS when a bucket is set."""
+    if (settings.store_backend or "").strip().lower() != "firestore":
+        return payload
+    max_bytes = int((os.getenv("FIRESTORE_JOB_MAX_OUTPUT_BYTES") or "950000").strip())
+    bucket_name = (os.getenv("META_MEDIA_BUCKET") or os.getenv("ASSET_MEDIA_BUCKET") or "").strip()
+    working = dict(payload)
+
+    # When a bucket is configured, always offload blobs so Firestore stays small and GET /assets/:id stays useful.
+    if bucket_name:
+        try:
+            working = _offload_media_fields_to_gcs(bucket_name, working)
+        except Exception:
+            log.exception("GCS offload failed (check bucket IAM for Cloud Run service account)")
+            working = dict(payload)
+
+    if _payload_json_size(working) <= max_bytes:
+        return working
+
+    trimmed = dict(working)
+    trimmed.pop("image_base64", None)
+    trimmed.pop("images_base64", None)
+    vids2 = trimmed.get("videos")
+    if isinstance(vids2, list) and vids2:
+        new_vids2: list[dict[str, Any]] = []
+        for v in vids2:
+            if not isinstance(v, dict):
+                continue
+            out_v2: dict[str, Any] = {}
+            if v.get("mime_type"):
+                out_v2["mime_type"] = v.get("mime_type")
+            if v.get("gcs_uri"):
+                out_v2["gcs_uri"] = v.get("gcs_uri")
+            new_vids2.append(out_v2)
+        trimmed["videos"] = new_vids2
+    trimmed["output_omitted"] = True
+    trimmed["output_omitted_reason"] = (
+        "Payload exceeded Firestore size limit. Set META_MEDIA_BUCKET or ASSET_MEDIA_BUCKET and grant the Cloud Run "
+        "service account storage.objectAdmin on that bucket, then redeploy."
+    )
+    return trimmed
 
 
 def _job_from_doc(d: dict[str, Any]) -> AssetJob:

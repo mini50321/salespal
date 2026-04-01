@@ -90,8 +90,8 @@ gcloud run deploy $ServiceName `
   --min-instances 0 `
   --max-instances 10 `
   --cpu 1 `
-  --memory 512Mi `
-  --timeout 60 `
+  --memory 1Gi `
+  --timeout 3600 `
   --concurrency 40 2>&1 | Out-Null
 if ($LASTEXITCODE -ne 0) {
   Write-Host "Cloud Run deploy failed for image:"

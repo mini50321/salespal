@@ -86,9 +86,14 @@ class Generator:
             vertexai.init(project=project, location=region)
             from vertexai.preview.vision_models import ImageGenerationModel
 
-            model_name = os.getenv("VERTEX_IMAGE_MODEL", "imagegeneration@006")
+            # imagegeneration@006 is retired; see Google migration guide for Vertex AI image models.
+            model_name = os.getenv("VERTEX_IMAGE_MODEL", "imagen-3.0-generate-002")
             model = ImageGenerationModel.from_pretrained(model_name)
-            num = max(1, n if asset_type == "carousel" else 1)
+            # Imagen requests typically allow a small batch (often max 4 per call).
+            max_per = int((os.getenv("VERTEX_IMAGE_MAX_PER_REQUEST") or "4").strip())
+            max_per = max(1, min(8, max_per))
+            raw_n = n if asset_type == "carousel" else 1
+            num = max(1, min(max_per, raw_n))
             img_kw = _image_gen_kwargs()
             out = model.generate_images(prompt=prompt, number_of_images=num, **img_kw)
             imgs = []

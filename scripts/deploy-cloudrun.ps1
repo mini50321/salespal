@@ -3,9 +3,11 @@ param(
   [Parameter(Mandatory = $true)][string]$ServiceName,
   [string]$Region = "asia-south1",
   [string]$StoreBackend = "firestore",
-  [string]$GeneratorBackend = "mock",
+  [string]$GeneratorBackend = "vertex",
   [string]$ConversationReplyBackend = "rules",
-  [string]$AllowUnauthenticated = "true"
+  [string]$AllowUnauthenticated = "true",
+  # Optional: GCS bucket name (no gs://) for Vertex image/carousel/video offload; required for reliable Firestore jobs.
+  [string]$MediaBucket = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -35,10 +37,14 @@ if ($LASTEXITCODE -ne 0) { throw "deploy step failed" }
 $envVars = @(
   "GCP_PROJECT_ID=$ProjectId",
   "GCP_REGION=$Region",
+  "VERTEX_VIDEO_REGION=$Region",
   "STORE_BACKEND=$StoreBackend",
   "GENERATOR_BACKEND=$GeneratorBackend",
   "CONVERSATION_REPLY_BACKEND=$ConversationReplyBackend"
 )
+if ($MediaBucket.Trim()) {
+  $envVars += "META_MEDIA_BUCKET=$($MediaBucket.Trim())"
+}
 
 gcloud run services update $ServiceName `
   --project $ProjectId `

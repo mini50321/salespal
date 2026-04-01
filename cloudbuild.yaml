@@ -34,7 +34,9 @@ steps:
       - --allow-unauthenticated
       - --min-instances=${_MIN_INSTANCES}
       - --max-instances=${_MAX_INSTANCES}
-      - --set-env-vars=GCP_PROJECT_ID=$PROJECT_ID,GCP_REGION=${_REGION},GENERATOR_BACKEND=mock,STORE_BACKEND=firestore
+      - --timeout=3600
+      - --memory=1Gi
+      - --set-env-vars=GCP_PROJECT_ID=$PROJECT_ID,GCP_REGION=${_REGION},GENERATOR_BACKEND=vertex,STORE_BACKEND=firestore
 
 images:
   - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_IMAGE}:$BUILD_ID

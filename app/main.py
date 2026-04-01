@@ -119,6 +119,49 @@ def _demo_ui_authorized() -> bool:
     return bool(got) and got == expected
 
 
+def _demo_allowed_media_gs_uri(gs: str) -> bool:
+    """Only serve objects from configured media buckets (demo key is not a full auth boundary)."""
+    for env_name in ("META_MEDIA_BUCKET", "ASSET_MEDIA_BUCKET"):
+        b = (os.getenv(env_name) or "").strip()
+        if b and (gs == f"gs://{b}" or gs.startswith(f"gs://{b}/")):
+            return True
+    return False
+
+
+@app.get("/demo/asset-media")
+def demo_asset_media():
+    """Stream GCS bytes through the app so <img>/<video> previews work reliably (redirect + signed URL often breaks)."""
+    if not _demo_ui_enabled():
+        return _err(404, "not found")
+    if not _demo_ui_authorized():
+        return _err(401, "unauthorized")
+    gs = (request.args.get("gs") or "").strip()
+    if not gs.startswith("gs://"):
+        return _err(400, "invalid gs")
+    if not _demo_allowed_media_gs_uri(gs):
+        log.warning("demo asset-media: rejected gs uri outside configured buckets")
+        return _err(403, "gs uri not allowed")
+    try:
+        from google.cloud import storage
+
+        from .social_meta import _parse_gs_uri
+
+        bucket_name, blob_name = _parse_gs_uri(gs)
+        blob = storage.Client().bucket(bucket_name).blob(blob_name)
+        if not blob.exists():
+            return _err(404, "object not found")
+        data = blob.download_as_bytes()
+        ct = (blob.content_type or "application/octet-stream").strip()
+        return Response(
+            data,
+            mimetype=ct,
+            headers={"Cache-Control": "private, max-age=300"},
+        )
+    except Exception as e:
+        log.exception("demo asset-media proxy")
+        return _err(502, str(e))
+
+
 @app.get("/demo")
 def demo_ui():
     if not _demo_ui_enabled():
@@ -383,6 +426,44 @@ def demo_ui():
         color: var(--muted);
         min-height: 1.25rem;
       }
+      .asset-preview-wrap {
+        margin-top: 0.75rem;
+        padding-top: 0.75rem;
+        border-top: 1px solid var(--border);
+      }
+      .asset-preview-h {
+        font-size: 0.6875rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: var(--muted);
+        margin-bottom: 0.5rem;
+      }
+      .asset-preview-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(132px, 1fr));
+        gap: 0.5rem;
+      }
+      .asset-preview-body img,
+      .asset-preview-body video {
+        width: 100%;
+        max-height: min(42vh, 320px);
+        object-fit: contain;
+        border-radius: 10px;
+        border: 1px solid var(--border);
+        background: #f8fafc;
+      }
+      .asset-preview-empty {
+        font-size: 0.8125rem;
+        color: var(--muted);
+        margin: 0;
+      }
+      .asset-preview-empty code {
+        font-size: 0.75rem;
+        background: #f1f5f9;
+        padding: 0.1rem 0.3rem;
+        border-radius: 4px;
+      }
     </style>
   </head>
   <body>
@@ -492,7 +573,7 @@ def demo_ui():
             <div class="btn-row">
               <button type="button" class="btn-primary" id="btn-asset" onclick="createAsset()">Generate asset</button>
             </div>
-            <p class="hint">Set <code>GENERATOR_BACKEND=vertex</code> on Cloud Run for live Vertex output; otherwise responses are mock.</p>
+            <p class="hint">Set <code>GENERATOR_BACKEND=vertex</code> for live Vertex output. For carousel/video with Firestore, set <code>META_MEDIA_BUCKET</code> (bucket name only). <strong>Video</strong> via Veo often takes <strong>several minutes</strong> — keep the page open; Cloud Run and Gunicorn must use a long request timeout (3600s in deploy scripts).</p>
           </div>
         </div>
 
@@ -505,6 +586,10 @@ def demo_ui():
               </div>
             </div>
             <p class="hint" style="margin:0">JSON from the backend. Share this panel during screen recordings.</p>
+            <div id="asset-preview-wrap" class="asset-preview-wrap" hidden>
+              <div class="asset-preview-h">Generated preview</div>
+              <div id="asset-preview-body" class="asset-preview-body"></div>
+            </div>
             <pre id="out">Select an action to view the response.</pre>
           </div>
         </aside>
@@ -518,8 +603,105 @@ def demo_ui():
     <script>
       const outEl = document.getElementById('out');
       const hintEl = document.getElementById('status-hint');
+      const assetPreviewWrap = document.getElementById('asset-preview-wrap');
+      const assetPreviewBody = document.getElementById('asset-preview-body');
+      const demoKey = new URLSearchParams(location.search).get('key') || '';
+
+      function isAssetJob(obj) {
+        return obj && typeof obj === 'object' && !Array.isArray(obj) &&
+          ['image', 'carousel', 'video'].indexOf(obj.asset_type) !== -1;
+      }
+      function clearAssetPreview() {
+        if (!assetPreviewWrap || !assetPreviewBody) return;
+        assetPreviewWrap.hidden = true;
+        assetPreviewBody.innerHTML = '';
+      }
+      function dataUrlFromImageB64(b64) {
+        if (!b64 || typeof b64 !== 'string') return '';
+        var s = b64.replace(/\\s/g, '');
+        if (!s) return '';
+        var mime = 'image/png';
+        if (s.indexOf('/9j/') === 0) mime = 'image/jpeg';
+        else if (s.indexOf('iVBORw') === 0) mime = 'image/png';
+        else if (s.indexOf('R0lGOD') === 0) mime = 'image/gif';
+        else if (s.indexOf('UklGR') === 0) mime = 'image/webp';
+        return 'data:' + mime + ';base64,' + s;
+      }
+      function mediaProxyUrl(gsUri) {
+        if (!gsUri) return '';
+        var u = '/demo/asset-media?gs=' + encodeURIComponent(gsUri);
+        if (demoKey) u += '&key=' + encodeURIComponent(demoKey);
+        return u;
+      }
+      function renderAssetPreview(job) {
+        if (!assetPreviewWrap || !assetPreviewBody) return;
+        var out = job && job.output;
+        if (!out || typeof out !== 'object') {
+          clearAssetPreview();
+          return;
+        }
+        var parts = [];
+        var b64 = out.image_base64;
+        var uri = out.image_gcs_uri;
+        var imgs = out.images_base64;
+        var uris = out.images_gcs_uris;
+        var videos = out.videos;
+
+        if (typeof b64 === 'string' && b64.trim()) {
+          var du = dataUrlFromImageB64(b64);
+          if (du) parts.push('<img alt="Generated image" src="' + du.replace(/"/g, '&quot;') + '" />');
+        } else if (typeof uri === 'string' && uri.indexOf('gs://') === 0) {
+          parts.push('<img alt="Generated image" src="' + mediaProxyUrl(uri).replace(/"/g, '&quot;') + '" />');
+        }
+
+        if (Array.isArray(imgs) && imgs.length) {
+          var cells = imgs.map(function (x) {
+            var d = dataUrlFromImageB64(x);
+            return d ? '<img alt="Carousel slide" src="' + d.replace(/"/g, '&quot;') + '" />' : '';
+          }).filter(Boolean);
+          if (cells.length) parts.push('<div class="asset-preview-grid">' + cells.join('') + '</div>');
+        } else if (Array.isArray(uris) && uris.length) {
+          var uriCells = uris.map(function (g) {
+            if (typeof g === 'string' && g.indexOf('gs://') === 0)
+              return '<img alt="Carousel slide" src="' + mediaProxyUrl(g).replace(/"/g, '&quot;') + '" />';
+            return '';
+          }).filter(Boolean);
+          if (uriCells.length) parts.push('<div class="asset-preview-grid">' + uriCells.join('') + '</div>');
+        }
+
+        if (Array.isArray(videos) && videos.length) {
+          for (var i = 0; i < videos.length; i++) {
+            var v = videos[i];
+            if (!v || typeof v !== 'object') continue;
+            var gcs = (v.gcs_uri || '').trim();
+            var vb64 = v.bytes_base64;
+            var mt = (v.mime_type || 'video/mp4').trim() || 'video/mp4';
+            if (gcs && gcs.indexOf('gs://') === 0) {
+              parts.push('<video controls playsinline preload="metadata" src="' +
+                mediaProxyUrl(gcs).replace(/"/g, '&quot;') + '"></video>');
+            } else if (typeof vb64 === 'string' && vb64.trim()) {
+              var raw = vb64.replace(/\\s/g, '');
+              var safeMt = mt.replace(/"/g, '');
+              parts.push('<video controls playsinline preload="metadata" src="data:' + safeMt + ';base64,' + raw + '"></video>');
+            }
+          }
+        }
+
+        if (out.output_omitted) {
+          parts.push('<p class="asset-preview-empty">Stored copy omitted media (size limit). Ensure <code>META_MEDIA_BUCKET</code> is set so images land in GCS, or use base64 in the response when running without offload.</p>');
+        }
+
+        if (!parts.length) {
+          clearAssetPreview();
+          return;
+        }
+        assetPreviewBody.innerHTML = parts.join('');
+        assetPreviewWrap.hidden = false;
+      }
       function show(obj) {
         outEl.textContent = (typeof obj === 'string') ? obj : JSON.stringify(obj, null, 2);
+        if (isAssetJob(obj)) renderAssetPreview(obj);
+        else clearAssetPreview();
       }
       function setBusy(id, busy) {
         const el = document.getElementById(id);
@@ -776,8 +958,17 @@ def create_asset():
     job = store.create(brand_id, asset_type, prompt, require_approval)
     try:
         out = gen.generate(asset_type, prompt, n)
-        job.output = out.payload
+        full_output = out.payload
         job.status = "awaiting_approval" if require_approval else "approved"
+        # Firestore documents max ~1 MiB; Vertex image base64 often exceeds that.
+        if (settings.store_backend or "").strip().lower() == "firestore":
+            from .firestore_stores import prepare_asset_output_for_firestore
+
+            # Persist and return Firestore-safe output (GCS URIs / trimmed fields). Do not put
+            # multi-MiB base64 back on the job — that breaks Firestore and huge POST bodies.
+            job.output = prepare_asset_output_for_firestore(settings, full_output)
+        else:
+            job.output = full_output
         store.update(job)
     except Exception as e:
         job.status = "failed"
