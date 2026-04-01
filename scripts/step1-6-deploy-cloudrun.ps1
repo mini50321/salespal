@@ -90,7 +90,7 @@ gcloud run deploy $ServiceName `
   --min-instances 0 `
   --max-instances 10 `
   --cpu 1 `
-  --memory 1Gi `
+  --memory 2Gi `
   --timeout 3600 `
   --concurrency 40 2>&1 | Out-Null
 if ($LASTEXITCODE -ne 0) {

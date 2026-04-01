@@ -13,6 +13,8 @@ from flask import Flask, Response, jsonify, request
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from .creative_assets import derive_imagen_prompts_from_brief, derive_video_plan_from_brief
+from .creative_brief import generate_creative_brief
 from .generator import Generator
 from .conversation_engine import conversation_to_qualification_dict, process_user_message
 from .persistence import build_conversation_store, build_stores
@@ -65,6 +67,8 @@ def index():
                 "whatsapp_webhook": "/v1/webhooks/whatsapp",
                 "public_chat_start": "/v1/public/chat/start",
                 "public_chat_message": "/v1/public/chat/message",
+                "creative_brief": "/v1/marketing/creative-brief",
+                "creative_assets": "/v1/marketing/creative-assets",
             },
         }
     )
@@ -464,6 +468,83 @@ def demo_ui():
         padding: 0.1rem 0.3rem;
         border-radius: 4px;
       }
+      pre#out.gen-out-pending {
+        opacity: 0.6;
+      }
+      .gen-loading-root {
+        margin: 0.75rem 0 0;
+        border-radius: 10px;
+        border: 1px solid var(--border);
+        background: linear-gradient(145deg, #f8fafc 0%, #f1f5f9 100%);
+        box-shadow: 0 1px 3px rgba(15, 23, 42, 0.06);
+        overflow: hidden;
+      }
+      .gen-loading-root[hidden] {
+        display: none !important;
+      }
+      .gen-loading-row {
+        display: flex;
+        align-items: flex-start;
+        gap: 1rem;
+        padding: 1rem 1.1rem 0.85rem;
+      }
+      .gen-loading-spinner {
+        width: 2.35rem;
+        height: 2.35rem;
+        border-radius: 50%;
+        border: 3px solid #e2e8f0;
+        border-top-color: var(--accent);
+        animation: gen-spin 0.88s linear infinite;
+        flex-shrink: 0;
+        margin-top: 0.1rem;
+      }
+      @keyframes gen-spin {
+        to { transform: rotate(360deg); }
+      }
+      .gen-loading-text {
+        flex: 1;
+        min-width: 0;
+      }
+      .gen-loading-title {
+        font-weight: 700;
+        font-size: 0.9rem;
+        color: var(--text);
+        letter-spacing: -0.01em;
+      }
+      .gen-loading-detail {
+        font-size: 0.8125rem;
+        color: var(--muted);
+        margin-top: 0.35rem;
+        line-height: 1.45;
+      }
+      .gen-loading-meta {
+        flex-shrink: 0;
+        font-variant-numeric: tabular-nums;
+        font-size: 0.78rem;
+        font-weight: 700;
+        color: var(--accent);
+        padding-top: 0.15rem;
+      }
+      .gen-loading-track {
+        height: 3px;
+        background: #e2e8f0;
+        margin: 0 1.1rem 1rem;
+        border-radius: 3px;
+        overflow: hidden;
+      }
+      .gen-loading-track::after {
+        content: "";
+        display: block;
+        height: 100%;
+        width: 42%;
+        background: linear-gradient(90deg, var(--accent), #38bdf8);
+        border-radius: 3px;
+        animation: gen-indeterminate 1.25s ease-in-out infinite;
+      }
+      @keyframes gen-indeterminate {
+        0% { transform: translateX(-100%); }
+        100% { transform: translateX(320%); }
+      }
     </style>
   </head>
   <body>
@@ -550,6 +631,63 @@ def demo_ui():
           <div class="card">
             <div class="card-h">
               <div>
+                <h3>Step 1 · Creative brief</h3>
+                <span>Website · PDF · text → plan JSON</span>
+              </div>
+            </div>
+            <div class="row2">
+              <div>
+                <label for="brief_source">Source type</label>
+                <select id="brief_source">
+                  <option value="text" selected>Brief text</option>
+                  <option value="url">Website URL</option>
+                  <option value="pdf">PDF file</option>
+                </select>
+              </div>
+              <div>
+                <label for="brief_brand_hint">Brand hint (optional)</label>
+                <input id="brief_brand_hint" placeholder="e.g. India enterprise B2B" autocomplete="off" />
+              </div>
+            </div>
+            <label for="brief_text" id="brief_text_label">Paste brief text or website URL</label>
+            <textarea id="brief_text" placeholder="Paste product copy, positioning notes, or a full website URL when you selected Website."></textarea>
+            <label for="brief_pdf" id="brief_pdf_label" hidden>PDF file</label>
+            <input type="file" id="brief_pdf" accept="application/pdf,.pdf" hidden />
+            <div class="btn-row">
+              <button type="button" class="btn-primary" id="btn-brief" onclick="createCreativeBrief()">Analyze &amp; build brief</button>
+            </div>
+            <div class="row2">
+              <div>
+                <label for="brief_carousel_n">Step 2 · Carousel panels</label>
+                <input id="brief_carousel_n" value="3" inputmode="numeric" />
+              </div>
+              <div style="display:flex;align-items:flex-end">
+                <button type="button" class="btn-secondary" id="btn-brief2" onclick="generateCreativeAssetsFromBrief()">Generate image &amp; carousel from last brief</button>
+              </div>
+            </div>
+            <div class="row2">
+              <div>
+                <label for="brief_video_total">Step 3 · Video total (seconds)</label>
+                <input id="brief_video_total" value="24" inputmode="numeric" />
+              </div>
+              <div>
+                <label for="brief_video_clip">Clip length (Veo fast)</label>
+                <select id="brief_video_clip">
+                  <option value="4">4</option>
+                  <option value="6">6</option>
+                  <option value="8" selected>8</option>
+                </select>
+              </div>
+              <div style="display:flex;align-items:flex-end">
+                <button type="button" class="btn-secondary" id="btn-brief3" onclick="generateCreativeVideoFromBrief()">Generate video from last brief</button>
+              </div>
+            </div>
+            <p class="hint">Steps 2–3 use <code>/v1/marketing/creative-assets</code> (planners + Imagen / stitched Veo). Step 3 needs <code>META_MEDIA_BUCKET</code> and a long HTTP timeout. Run Step 1 first.</p>
+          </div>
+
+          <div class="card">
+            <div class="card-h">
+              <div>
                 <h3>Vertex marketing asset</h3>
                 <span>Image · carousel · video</span>
               </div>
@@ -568,6 +706,24 @@ def demo_ui():
                 <input id="asset_n" value="1" inputmode="numeric" />
               </div>
             </div>
+            <div class="row2">
+              <div>
+                <label for="video_total_seconds">Video total seconds</label>
+                <input id="video_total_seconds" value="8" inputmode="numeric" />
+              </div>
+              <div>
+                <label for="video_clip_seconds">Video clip seconds</label>
+                <select id="video_clip_seconds">
+                  <option value="4">4</option>
+                  <option value="6">6</option>
+                  <option value="8" selected>8</option>
+                </select>
+              </div>
+            </div>
+            <label for="video_continuity_text">Video continuity (optional)</label>
+            <textarea id="video_continuity_text" placeholder="Example: Same character (orange tabby cat), same setting (modern living room), same camera style (handheld, shallow depth of field), same lighting (warm), consistent outfit/props. Keep brand colors: #0A66C2 and #111827."></textarea>
+            <label for="video_storyboard">Storyboard (optional, one line per 8s scene)</label>
+            <textarea id="video_storyboard" placeholder="Scene 1: Establish cat in living room.\nScene 2: Cat interacts with phone showing SalesPal.\nScene 3: CTA screen with logo and tagline."></textarea>
             <label for="asset_prompt">Prompt</label>
             <textarea id="asset_prompt">Create a premium B2B marketing visual for SalesPal 360 (India, enterprise tone).</textarea>
             <div class="btn-row">
@@ -586,6 +742,17 @@ def demo_ui():
               </div>
             </div>
             <p class="hint" style="margin:0">JSON from the backend. Share this panel during screen recordings.</p>
+            <div id="gen-loading-root" class="gen-loading-root" hidden aria-live="polite" aria-busy="false">
+              <div class="gen-loading-row">
+                <div class="gen-loading-spinner" aria-hidden="true"></div>
+                <div class="gen-loading-text">
+                  <div class="gen-loading-title" id="gen-loading-title">Generating</div>
+                  <div class="gen-loading-detail" id="gen-loading-detail"></div>
+                </div>
+                <div class="gen-loading-meta"><span id="gen-loading-elapsed">0s</span></div>
+              </div>
+              <div class="gen-loading-track" aria-hidden="true"></div>
+            </div>
             <div id="asset-preview-wrap" class="asset-preview-wrap" hidden>
               <div class="asset-preview-h">Generated preview</div>
               <div id="asset-preview-body" class="asset-preview-body"></div>
@@ -698,14 +865,78 @@ def demo_ui():
         assetPreviewBody.innerHTML = parts.join('');
         assetPreviewWrap.hidden = false;
       }
+      var lastCreativeBrief = null;
       function show(obj) {
         outEl.textContent = (typeof obj === 'string') ? obj : JSON.stringify(obj, null, 2);
         if (isAssetJob(obj)) renderAssetPreview(obj);
-        else clearAssetPreview();
+        else if (obj && typeof obj === 'object' && Array.isArray(obj.jobs) && obj.jobs.length) {
+          var pick = null;
+          var k = 0;
+          for (k = 0; k < obj.jobs.length; k++) {
+            if (isAssetJob(obj.jobs[k]) && obj.jobs[k].asset_type === 'video' && obj.jobs[k].output) {
+              pick = obj.jobs[k];
+              break;
+            }
+          }
+          if (!pick) {
+            for (var i = obj.jobs.length - 1; i >= 0; i--) {
+              if (isAssetJob(obj.jobs[i]) && obj.jobs[i].output) { pick = obj.jobs[i]; break; }
+            }
+          }
+          if (!pick) {
+            for (var j = obj.jobs.length - 1; j >= 0; j--) {
+              if (isAssetJob(obj.jobs[j])) { pick = obj.jobs[j]; break; }
+            }
+          }
+          if (pick) renderAssetPreview(pick);
+          else clearAssetPreview();
+        } else clearAssetPreview();
       }
       function setBusy(id, busy) {
         const el = document.getElementById(id);
         if (el) el.disabled = !!busy;
+      }
+      var genLoadingTimer = null;
+      var genLoadingStart = 0;
+      function formatGenElapsed(ms) {
+        var s = Math.floor(ms / 1000);
+        var m = Math.floor(s / 60);
+        s = s % 60;
+        if (m > 0) return m + ':' + (s < 10 ? '0' : '') + s;
+        return s + 's';
+      }
+      function startAssetGenerationLoading(title, detail) {
+        var root = document.getElementById('gen-loading-root');
+        var titleEl = document.getElementById('gen-loading-title');
+        var detailEl = document.getElementById('gen-loading-detail');
+        var elapsedEl = document.getElementById('gen-loading-elapsed');
+        if (!root || !titleEl || !detailEl || !elapsedEl) return;
+        titleEl.textContent = title;
+        detailEl.textContent = detail || '';
+        root.hidden = false;
+        root.setAttribute('aria-busy', 'true');
+        outEl.classList.add('gen-out-pending');
+        outEl.textContent = 'Response JSON will appear here when the request finishes.';
+        clearAssetPreview();
+        genLoadingStart = Date.now();
+        if (genLoadingTimer) clearInterval(genLoadingTimer);
+        elapsedEl.textContent = '0s';
+        genLoadingTimer = setInterval(function () {
+          elapsedEl.textContent = formatGenElapsed(Date.now() - genLoadingStart);
+        }, 1000);
+        hintEl.textContent = 'Generating…';
+      }
+      function stopAssetGenerationLoading() {
+        if (genLoadingTimer) {
+          clearInterval(genLoadingTimer);
+          genLoadingTimer = null;
+        }
+        var root = document.getElementById('gen-loading-root');
+        if (root) {
+          root.hidden = true;
+          root.setAttribute('aria-busy', 'false');
+        }
+        outEl.classList.remove('gen-out-pending');
       }
       async function callGet(path) {
         hintEl.textContent = 'Requesting ' + path + '…';
@@ -766,8 +997,133 @@ def demo_ui():
         show(data);
         } finally { setBusy('btn-zoho', false); }
       }
+      function toggleBriefSource() {
+        var st = document.getElementById('brief_source').value;
+        var ta = document.getElementById('brief_text');
+        var lab = document.getElementById('brief_text_label');
+        var pdfL = document.getElementById('brief_pdf_label');
+        var pdfI = document.getElementById('brief_pdf');
+        if (st === 'pdf') {
+          ta.hidden = true;
+          lab.hidden = true;
+          pdfL.hidden = false;
+          pdfI.hidden = false;
+        } else {
+          ta.hidden = false;
+          lab.hidden = false;
+          pdfL.hidden = true;
+          pdfI.hidden = true;
+        }
+        lab.textContent = st === 'url' ? 'Website URL (https://…)' : 'Paste brief text or notes';
+      }
+      async function createCreativeBrief() {
+        setBusy('btn-brief', true);
+        try {
+          var st = document.getElementById('brief_source').value;
+          var brand = document.getElementById('lead_brand').value.trim() || 'demo';
+          var hint = (document.getElementById('brief_brand_hint').value || '').trim();
+          var body = { brand_id: brand, source_type: st };
+          if (hint) body.brand_hint = hint;
+          if (st === 'pdf') {
+            var f = document.getElementById('brief_pdf').files[0];
+            if (!f) { show('Choose a PDF file.'); hintEl.textContent = ''; return; }
+            var b64 = await new Promise(function (resolve, reject) {
+              var r = new FileReader();
+              r.onload = function () {
+                var s = r.result;
+                var i = s.indexOf(',');
+                resolve(i >= 0 ? s.slice(i + 1) : s);
+              };
+              r.onerror = reject;
+              r.readAsDataURL(f);
+            });
+            body.pdf_base64 = b64;
+          } else if (st === 'url') {
+            body.url = document.getElementById('brief_text').value.trim();
+          } else {
+            body.text = document.getElementById('brief_text').value.trim();
+          }
+          var data = await callJson('/v1/marketing/creative-brief', body);
+          if (data && data.brief && !data._http) lastCreativeBrief = data.brief;
+          show(data);
+        } finally {
+          setBusy('btn-brief', false);
+        }
+      }
+      async function generateCreativeAssetsFromBrief() {
+        if (!lastCreativeBrief) {
+          show('Run Step 1 successfully first (no brief in this tab yet).');
+          hintEl.textContent = '';
+          return;
+        }
+        setBusy('btn-brief2', true);
+        startAssetGenerationLoading(
+          'Creating image & carousel',
+          'Gemini is drafting prompts from your brief, then Imagen will generate the still and all carousel panels. This may take a few minutes.'
+        );
+        try {
+          var cn = parseInt(document.getElementById('brief_carousel_n').value || '3', 10);
+          if (!isFinite(cn) || cn < 1) cn = 3;
+          var body = {
+            brand_id: document.getElementById('lead_brand').value.trim() || 'demo',
+            brief: lastCreativeBrief,
+            asset_types: ['image', 'carousel'],
+            carousel_n: cn,
+            require_approval: false,
+          };
+          var data = await callJson('/v1/marketing/creative-assets', body);
+          show(data);
+        } finally {
+          stopAssetGenerationLoading();
+          setBusy('btn-brief2', false);
+        }
+      }
+      async function generateCreativeVideoFromBrief() {
+        if (!lastCreativeBrief) {
+          show('Run Step 1 successfully first (no brief in this tab yet).');
+          hintEl.textContent = '';
+          return;
+        }
+        setBusy('btn-brief3', true);
+        startAssetGenerationLoading(
+          'Creating video from brief',
+          'Gemini is planning the storyboard; then Vertex Veo renders each clip and stitches the MP4. Long runs often take several minutes—keep this tab open and wait for HTTP completion.'
+        );
+        try {
+          var total = parseInt(document.getElementById('brief_video_total').value || '24', 10);
+          var clip = parseInt(document.getElementById('brief_video_clip').value || '8', 10);
+          var body = {
+            brand_id: document.getElementById('lead_brand').value.trim() || 'demo',
+            brief: lastCreativeBrief,
+            asset_types: ['video'],
+            video_total_seconds: isFinite(total) && total >= 4 ? total : 24,
+            video_clip_seconds: isFinite(clip) && clip > 0 ? clip : 8,
+            require_approval: false,
+          };
+          var data = await callJson('/v1/marketing/creative-assets', body);
+          show(data);
+        } finally {
+          stopAssetGenerationLoading();
+          setBusy('btn-brief3', false);
+        }
+      }
+      document.getElementById('brief_source').addEventListener('change', toggleBriefSource);
+      toggleBriefSource();
       async function createAsset() {
         setBusy('btn-asset', true);
+        var at = document.getElementById('asset_type').value;
+        var nAsk = parseInt(document.getElementById('asset_n').value || '1', 10);
+        var loadTitle = 'Generating image';
+        var loadDetail = 'Vertex Imagen is rendering your creative. Usually under a minute.';
+        if (at === 'carousel') {
+          loadTitle = 'Generating carousel';
+          var np = isFinite(nAsk) && nAsk > 0 ? nAsk : 1;
+          loadDetail = 'Imagen is creating ' + np + ' consistent panel(s). Larger batches take longer.';
+        } else if (at === 'video') {
+          loadTitle = 'Generating video';
+          loadDetail = 'Vertex Veo is producing clip(s) and stitching when needed. Expect several minutes for long or multi-segment videos—do not close this tab.';
+        }
+        startAssetGenerationLoading(loadTitle, loadDetail);
         try {
         const body = {
           brand_id: document.getElementById('lead_brand').value.trim(),
@@ -775,10 +1131,30 @@ def demo_ui():
           prompt: document.getElementById('asset_prompt').value,
           n: parseInt(document.getElementById('asset_n').value || '1', 10),
           require_approval: false,
+          options: {},
         };
+        if (body.asset_type === 'video') {
+          const total = parseInt(document.getElementById('video_total_seconds').value || '8', 10);
+          const clip = parseInt(document.getElementById('video_clip_seconds').value || '8', 10);
+          const cont = (document.getElementById('video_continuity_text').value || '').trim();
+          const sbRaw = (document.getElementById('video_storyboard').value || '').trim();
+          // If total > 8, backend will generate multiple short clips and stitch into one MP4.
+          body.options.video_total_seconds = isFinite(total) ? total : 8;
+          body.options.video_clip_seconds = isFinite(clip) ? clip : 8;
+          if (cont) body.options.video_continuity_text = cont;
+          if (sbRaw) {
+            const lines = sbRaw.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+            if (lines.length) body.options.video_storyboard = lines;
+          }
+        } else {
+          delete body.options;
+        }
         const data = await callJson('/v1/marketing/assets', body);
         show(data);
-        } finally { setBusy('btn-asset', false); }
+        } finally {
+          stopAssetGenerationLoading();
+          setBusy('btn-asset', false);
+        }
       }
     </script>
   </body>
@@ -937,6 +1313,167 @@ def readyz():
     return jsonify({"status": "ready", "store": settings.store_backend})
 
 
+@app.post("/v1/marketing/creative-brief")
+def creative_brief_route():
+    """Step 1: ingest URL / text / PDF and return a structured marketing brief (Vertex Gemini JSON)."""
+    body = request.get_json(force=True, silent=True) or {}
+    brand_id = str(body.get("brand_id") or "demo").strip()
+    source_type = str(body.get("source_type") or "").strip().lower()
+    brand_hint = str(body.get("brand_hint") or "").strip() or None
+
+    if not brand_id or len(brand_id) > 64:
+        return _err(400, "invalid brand_id")
+    if source_type not in ("text", "url", "pdf", "pdf_base64"):
+        return _err(400, "invalid source_type (use text, url, or pdf)")
+
+    text_v = body.get("text")
+    url_v = body.get("url")
+    pdf_b64 = body.get("pdf_base64")
+    if source_type == "text" and (not isinstance(text_v, str) or not text_v.strip()):
+        return _err(400, "text required for source_type text")
+    if source_type == "url" and (not isinstance(url_v, str) or not url_v.strip()):
+        return _err(400, "url required for source_type url")
+    if source_type in ("pdf", "pdf_base64") and (not isinstance(pdf_b64, str) or not pdf_b64.strip()):
+        return _err(400, "pdf_base64 required for source_type pdf")
+    try:
+        out = generate_creative_brief(
+            source_type=source_type,
+            text=str(text_v).strip() if isinstance(text_v, str) else None,
+            url=str(url_v).strip() if isinstance(url_v, str) else None,
+            pdf_base64=str(pdf_b64).strip() if isinstance(pdf_b64, str) else None,
+            brand_hint=brand_hint,
+        )
+        out["brand_id"] = brand_id
+        return jsonify(out)
+    except ValueError as e:
+        return _err(400, str(e))
+    except RuntimeError as e:
+        return _err(503, str(e))
+    except Exception as e:
+        log.exception("creative brief route")
+        return _err(500, str(e))
+
+
+def _run_asset_generation(
+    brand_id: str,
+    asset_type: str,
+    prompt: str,
+    n: int,
+    require_approval: bool,
+    options: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Create a store job, run the generator, persist output (Firestore-safe when configured)."""
+    job = store.create(brand_id, asset_type, prompt, require_approval)
+    try:
+        out = gen.generate(asset_type, prompt, n, options=options)
+        full_output = out.payload
+        job.status = "awaiting_approval" if require_approval else "approved"
+        if (settings.store_backend or "").strip().lower() == "firestore":
+            from .firestore_stores import prepare_asset_output_for_firestore
+
+            job.output = prepare_asset_output_for_firestore(settings, full_output)
+        else:
+            job.output = full_output
+        store.update(job)
+    except Exception as e:
+        job.status = "failed"
+        job.error = str(e)
+        store.update(job)
+
+    return job.__dict__
+
+
+@app.post("/v1/marketing/creative-assets")
+def creative_assets_route():
+    """Steps 2–3: from Step 1 `brief`, derive prompts and generate image, carousel, and/or video."""
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    brand_id = str(body.get("brand_id") or "demo").strip()
+    brief = body.get("brief")
+    asset_types_raw = body.get("asset_types")
+    if not isinstance(asset_types_raw, list) or not asset_types_raw:
+        asset_types = ["image", "carousel"]
+    else:
+        asset_types = [str(x).strip().lower() for x in asset_types_raw if str(x).strip()]
+    carousel_n = int(body.get("carousel_n") or 3)
+    require_approval = bool(body.get("require_approval", False))
+    options = body.get("options") if isinstance(body.get("options"), dict) else None
+
+    if not brand_id or len(brand_id) > 64:
+        return _err(400, "invalid brand_id")
+    if not isinstance(brief, dict) or not brief:
+        return _err(400, "brief object required (use output.brief from Step 1)")
+    allowed = {"image", "carousel", "video"}
+    if not set(asset_types).issubset(allowed):
+        return _err(400, "asset_types must be a subset of image, carousel, video")
+
+    needs_image = "image" in asset_types
+    needs_carousel = "carousel" in asset_types
+    needs_video = "video" in asset_types
+
+    if needs_carousel and (carousel_n < 1 or carousel_n > 10):
+        return _err(400, "carousel_n must be 1–10")
+
+    prompts_used: dict[str, Any] = {}
+    try:
+        if needs_image or needs_carousel:
+            prompts_meta = derive_imagen_prompts_from_brief(brief, carousel_n=carousel_n)
+            prompts_used.update(prompts_meta)
+        if needs_video:
+            try:
+                v_total = int(body.get("video_total_seconds") or 24)
+            except (TypeError, ValueError):
+                return _err(400, "video_total_seconds must be an integer")
+            try:
+                v_clip = int(body.get("video_clip_seconds") or 8)
+            except (TypeError, ValueError):
+                return _err(400, "video_clip_seconds must be an integer")
+            video_plan = derive_video_plan_from_brief(brief, total_seconds=v_total, clip_seconds=v_clip)
+            prompts_used["video"] = video_plan
+    except ValueError as e:
+        return _err(400, str(e))
+    except RuntimeError as e:
+        return _err(503, str(e))
+    except Exception as e:
+        log.exception("creative assets derive prompts")
+        return _err(500, str(e))
+
+    jobs: list[dict[str, Any]] = []
+
+    if needs_image:
+        image_prompt = str(prompts_used.get("image_prompt") or "").strip()
+        if not image_prompt:
+            return _err(500, "missing image_prompt after planning")
+        jobs.append(_run_asset_generation(brand_id, "image", image_prompt, 1, require_approval, options))
+    if needs_carousel:
+        carousel_n_eff = int(prompts_used.get("carousel_n") or carousel_n)
+        carousel_n_eff = max(1, min(10, carousel_n_eff))
+        carousel_prompt = str(prompts_used.get("carousel_prompt") or "").strip()
+        if not carousel_prompt:
+            return _err(500, "missing carousel_prompt after planning")
+        jobs.append(
+            _run_asset_generation(brand_id, "carousel", carousel_prompt, carousel_n_eff, require_approval, options)
+        )
+    if needs_video:
+        vp = prompts_used.get("video")
+        if not isinstance(vp, dict):
+            return _err(500, "missing video plan after planning")
+        vid_opts: dict[str, Any] = dict(options) if options else {}
+        vid_opts["video_total_seconds"] = int(vp["total_seconds"])
+        vid_opts["video_clip_seconds"] = int(vp["clip_seconds"])
+        cont = vp.get("video_continuity_text")
+        if isinstance(cont, str) and cont.strip():
+            vid_opts["video_continuity_text"] = cont.strip()
+        sb = vp.get("video_storyboard")
+        if isinstance(sb, list):
+            vid_opts["video_storyboard"] = sb
+        v_prompt = str(vp.get("video_prompt") or "").strip()
+        if not v_prompt:
+            return _err(500, "missing video_prompt after planning")
+        jobs.append(_run_asset_generation(brand_id, "video", v_prompt, 1, require_approval, vid_opts))
+
+    return jsonify({"brand_id": brand_id, "prompts_used": prompts_used, "jobs": jobs})
+
+
 @app.post("/v1/marketing/assets")
 def create_asset():
     body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
@@ -955,27 +1492,8 @@ def create_asset():
     if n < 1 or n > 10:
         return _err(400, "invalid n")
 
-    job = store.create(brand_id, asset_type, prompt, require_approval)
-    try:
-        out = gen.generate(asset_type, prompt, n)
-        full_output = out.payload
-        job.status = "awaiting_approval" if require_approval else "approved"
-        # Firestore documents max ~1 MiB; Vertex image base64 often exceeds that.
-        if (settings.store_backend or "").strip().lower() == "firestore":
-            from .firestore_stores import prepare_asset_output_for_firestore
-
-            # Persist and return Firestore-safe output (GCS URIs / trimmed fields). Do not put
-            # multi-MiB base64 back on the job — that breaks Firestore and huge POST bodies.
-            job.output = prepare_asset_output_for_firestore(settings, full_output)
-        else:
-            job.output = full_output
-        store.update(job)
-    except Exception as e:
-        job.status = "failed"
-        job.error = str(e)
-        store.update(job)
-
-    return jsonify(job.__dict__)
+    options = body.get("options") if isinstance(body.get("options"), dict) else None
+    return jsonify(_run_asset_generation(brand_id, asset_type, prompt, n, require_approval, options))
 
 
 @app.get("/v1/marketing/assets")
