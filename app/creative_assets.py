@@ -22,7 +22,7 @@ def _get_prompt_planner():
     if not project:
         return None
     region = (os.getenv("VERTEX_ASSETS_REGION") or os.getenv("VERTEX_BRIEF_REGION") or settings.gcp_region or "us-central1").strip()
-    model_name = (os.getenv("VERTEX_ASSETS_MODEL") or os.getenv("VERTEX_BRIEF_MODEL") or "gemini-2.0-flash-001").strip()
+    model_name = (os.getenv("VERTEX_ASSETS_MODEL") or os.getenv("VERTEX_BRIEF_MODEL") or "gemini-2.5-flash").strip()
     key = (project, region, model_name)
     if _PLANNER is not None and _PLANNER_KEY == key:
         return _PLANNER
@@ -46,7 +46,7 @@ def _get_video_planner():
     if not project:
         return None
     region = (os.getenv("VERTEX_ASSETS_REGION") or os.getenv("VERTEX_BRIEF_REGION") or settings.gcp_region or "us-central1").strip()
-    model_name = (os.getenv("VERTEX_VIDEO_PLAN_MODEL") or os.getenv("VERTEX_ASSETS_MODEL") or os.getenv("VERTEX_BRIEF_MODEL") or "gemini-2.0-flash-001").strip()
+    model_name = (os.getenv("VERTEX_VIDEO_PLAN_MODEL") or os.getenv("VERTEX_ASSETS_MODEL") or os.getenv("VERTEX_BRIEF_MODEL") or "gemini-2.5-flash").strip()
     key = (project, region, model_name)
     if _VIDEO_PLANNER is not None and _VIDEO_PLANNER_KEY == key:
         return _VIDEO_PLANNER
@@ -114,7 +114,7 @@ Brief JSON:
 
 Output valid JSON only. video_storyboard must have exactly {segs} strings."""
 
-    model_id = (os.getenv("VERTEX_VIDEO_PLAN_MODEL") or os.getenv("VERTEX_ASSETS_MODEL") or os.getenv("VERTEX_BRIEF_MODEL") or "gemini-2.0-flash-001").strip()
+    model_id = (os.getenv("VERTEX_VIDEO_PLAN_MODEL") or os.getenv("VERTEX_ASSETS_MODEL") or os.getenv("VERTEX_BRIEF_MODEL") or "gemini-2.5-flash").strip()
 
     def _json_mode() -> dict[str, Any]:
         from vertexai.generative_models import GenerationConfig
@@ -193,6 +193,9 @@ Output valid JSON only. video_storyboard must have exactly {segs} strings."""
         "total_seconds": total,
         "video_planner_model": model_id,
     }
+
+
+def derive_imagen_prompts_from_brief(brief: dict[str, Any], *, carousel_n: int) -> dict[str, str]:
     """
     Turn Step 1 `brief` into Imagen-ready prompts for one still and one N-panel carousel request.
     """
@@ -218,7 +221,7 @@ Brief JSON:
 
 Output valid JSON only."""
 
-    model_id = (os.getenv("VERTEX_ASSETS_MODEL") or os.getenv("VERTEX_BRIEF_MODEL") or "gemini-2.0-flash-001").strip()
+    model_id = (os.getenv("VERTEX_ASSETS_MODEL") or os.getenv("VERTEX_BRIEF_MODEL") or "gemini-2.5-flash").strip()
 
     def _json_mode() -> dict[str, Any]:
         from vertexai.generative_models import GenerationConfig
@@ -287,5 +290,113 @@ Output valid JSON only."""
         "image_prompt": ip,
         "carousel_prompt": cp,
         "carousel_n": cn,
+        "planner_model": model_id,
+    }
+
+
+def derive_autonomous_campaign_params(brief: dict[str, Any]) -> dict[str, Any]:
+    """
+    Decide carousel depth and long-form video stitch parameters from the brief alone (no user prompts).
+    """
+    if not isinstance(brief, dict) or not brief:
+        raise ValueError("brief must be a non-empty object")
+
+    model = _get_prompt_planner()
+    if model is None:
+        raise RuntimeError("GCP_PROJECT_ID is required for autonomous campaign planning")
+
+    max_total = int(os.getenv("VERTEX_VIDEO_MAX_TOTAL_SECONDS") or "180")
+    brief_json = json.dumps(brief, ensure_ascii=False, default=str)
+    if len(brief_json) > 32000:
+        brief_json = brief_json[:32000] + "\n…"
+
+    user = f"""You are planning an automated paid-social campaign from a structured marketing brief JSON.
+
+Produce ONE JSON object with keys:
+- carousel_panel_count (integer): how many distinct carousel panels to generate (3–7). Base on story complexity and key_messages count.
+- video_total_seconds (integer): target total length for a STITCHED multi-clip ad (16–{min(120, max_total)}). Prefer 24–48 for B2B; longer only if the brief clearly needs a story arc. Must be ≤ {max_total}.
+- video_clip_seconds (integer): per-clip length for Veo fast; MUST be exactly 4, 6, or 8.
+- planning_rationale (string): one short sentence for stakeholders (non-technical).
+
+Brief JSON:
+{brief_json}
+
+Output valid JSON only."""
+
+    model_id = (os.getenv("VERTEX_ASSETS_MODEL") or os.getenv("VERTEX_BRIEF_MODEL") or "gemini-2.5-flash").strip()
+
+    def _json_mode() -> dict[str, Any]:
+        from vertexai.generative_models import GenerationConfig
+
+        cfg = GenerationConfig(
+            max_output_tokens=int((os.getenv("VERTEX_ASSETS_MAX_TOKENS") or "2048").strip() or "2048"),
+            temperature=float((os.getenv("VERTEX_ASSETS_TEMPERATURE") or "0.4").strip() or "0.4"),
+            response_mime_type="application/json",
+        )
+        resp = model.generate_content(user, generation_config=cfg)
+        if not resp.candidates:
+            raise RuntimeError("no candidates from autonomous planner")
+        parts = resp.candidates[0].content.parts
+        raw = "".join(getattr(p, "text", "") or "" for p in parts).strip()
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            raise RuntimeError("autonomous planner returned non-object JSON")
+        return data
+
+    def _text_mode() -> dict[str, Any]:
+        from vertexai.generative_models import GenerationConfig
+
+        cfg = GenerationConfig(
+            max_output_tokens=int((os.getenv("VERTEX_ASSETS_MAX_TOKENS") or "2048").strip() or "2048"),
+            temperature=float((os.getenv("VERTEX_ASSETS_TEMPERATURE") or "0.4").strip() or "0.4"),
+        )
+        resp = model.generate_content(user, generation_config=cfg)
+        if not resp.candidates:
+            raise RuntimeError("no candidates from autonomous planner")
+        parts = resp.candidates[0].content.parts
+        raw = "".join(getattr(p, "text", "") or "" for p in parts).strip()
+        m = re.search(r"\{[\s\S]*\}", raw)
+        if not m:
+            raise RuntimeError("autonomous planner returned no JSON object")
+        data = json.loads(m.group(0))
+        if not isinstance(data, dict):
+            raise RuntimeError("autonomous planner returned non-object JSON")
+        return data
+
+    try:
+        try:
+            data = _json_mode()
+        except Exception:
+            log.warning("autonomous campaign: JSON mode failed, retrying text parse")
+            data = _text_mode()
+    except json.JSONDecodeError:
+        log.exception("autonomous campaign JSON parse")
+        raise RuntimeError("autonomous planner returned invalid JSON") from None
+
+    try:
+        cn = int(data.get("carousel_panel_count") or 4)
+    except (TypeError, ValueError):
+        cn = 4
+    cn = max(3, min(7, cn))
+
+    try:
+        vt = int(data.get("video_total_seconds") or 32)
+    except (TypeError, ValueError):
+        vt = 32
+    vt = max(16, min(max_total, vt))
+
+    try:
+        vclip = int(data.get("video_clip_seconds") or 8)
+    except (TypeError, ValueError):
+        vclip = 8
+    vclip = _snap_veo_clip_seconds(vclip)
+
+    rationale = str(data.get("planning_rationale") or "").strip() or "Planned from brief content and recommended formats."
+
+    return {
+        "carousel_panel_count": cn,
+        "video_total_seconds": vt,
+        "video_clip_seconds": vclip,
+        "planning_rationale": rationale[:500],
         "planner_model": model_id,
     }

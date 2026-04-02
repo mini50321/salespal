@@ -28,7 +28,7 @@ def _get_brief_model():
     if not project:
         return None
     region = (os.getenv("VERTEX_BRIEF_REGION") or settings.gcp_region or "us-central1").strip()
-    model_name = (os.getenv("VERTEX_BRIEF_MODEL") or "gemini-2.0-flash-001").strip()
+    model_name = (os.getenv("VERTEX_BRIEF_MODEL") or "gemini-2.5-flash").strip()
     key = (project, region, model_name)
     if _MODEL is not None and _INIT_KEY == key:
         return _MODEL
@@ -164,7 +164,7 @@ def generate_creative_brief(
 
     prompt = _build_prompt(source_label=label, body=body, brand_hint=brand_hint)
 
-    model_id = (os.getenv("VERTEX_BRIEF_MODEL") or "gemini-2.0-flash-001").strip()
+    model_id = (os.getenv("VERTEX_BRIEF_MODEL") or "gemini-2.5-flash").strip()
 
     def _call_json_mode() -> dict[str, Any]:
         from vertexai.generative_models import GenerationConfig

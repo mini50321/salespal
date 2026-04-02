@@ -23,7 +23,7 @@ def _get_model():
     region = (settings.gcp_region or "asia-south1").strip()
     if not project:
         return None
-    model_name = (os.getenv("VERTEX_CHAT_MODEL") or "gemini-2.0-flash-001").strip()
+    model_name = (os.getenv("VERTEX_CHAT_MODEL") or "gemini-2.5-flash").strip()
     key = (project, region, model_name)
     if _MODEL is not None and _INIT_KEY == key:
         return _MODEL

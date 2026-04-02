@@ -94,17 +94,41 @@ class Generator:
             # Imagen requests typically allow a small batch (often max 4 per call).
             max_per = int((os.getenv("VERTEX_IMAGE_MAX_PER_REQUEST") or "4").strip())
             max_per = max(1, min(8, max_per))
-            raw_n = n if asset_type == "carousel" else 1
-            num = max(1, min(max_per, raw_n))
+            opt = options or {}
             img_kw = _image_gen_kwargs()
-            out = model.generate_images(prompt=prompt, number_of_images=num, **img_kw)
-            imgs = []
-            for img in out.images:
-                b = img._image_bytes
-                imgs.append(base64.b64encode(b).decode("ascii"))
-            if asset_type == "carousel":
-                return GeneratedAsset(asset_type="carousel", payload={"images_base64": imgs, "prompt": prompt})
-            return GeneratedAsset(asset_type="image", payload={"image_base64": imgs[0], "prompt": prompt})
+            iar = opt.get("image_aspect_ratio")
+            if isinstance(iar, str) and iar.strip():
+                img_kw["aspect_ratio"] = iar.strip()
+            raw_n = n if asset_type == "carousel" else 1
+            raw_n = max(1, min(10, int(raw_n)))
+
+            if asset_type == "image":
+                num = 1
+                out = model.generate_images(prompt=prompt, number_of_images=num, **img_kw)
+                imgs = []
+                for img in out.images:
+                    b = img._image_bytes
+                    imgs.append(base64.b64encode(b).decode("ascii"))
+                if not imgs:
+                    raise RuntimeError("imagen returned no images")
+                return GeneratedAsset(asset_type="image", payload={"image_base64": imgs[0], "prompt": prompt})
+
+            imgs: list[str] = []
+            remaining = raw_n
+            while remaining > 0:
+                batch = min(max_per, remaining)
+                out = model.generate_images(prompt=prompt, number_of_images=batch, **img_kw)
+                got = 0
+                for img in out.images:
+                    b = img._image_bytes
+                    imgs.append(base64.b64encode(b).decode("ascii"))
+                    got += 1
+                if got == 0:
+                    break
+                remaining -= got
+            if len(imgs) < raw_n:
+                raise RuntimeError(f"imagen carousel: expected {raw_n} images, got {len(imgs)}")
+            return GeneratedAsset(asset_type="carousel", payload={"images_base64": imgs[:raw_n], "prompt": prompt})
 
         if asset_type == "video":
             from .vertex_video import generate_long_video_stitched, generate_videos_veo

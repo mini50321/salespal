@@ -24,6 +24,37 @@ gcloud auth login
 
 It will print the **Cloud Run URL** at the end.
 
+## Run locally (Windows / PowerShell)
+
+This is the fastest way to iterate on the demo UI without redeploying.
+
+1) Create a virtualenv and install deps (once):
+
+```powershell
+cd "D:\my project\whatsapp dev"
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+2) Start the local dev server:
+
+```powershell
+.\scripts\run-local.ps1 -Port 8080
+```
+
+Open:
+
+- `http://localhost:8080/`
+
+If you edit the UI in `app/main.py`, stop the server (Ctrl+C) and rerun the command (Windows reloader can be flaky).
+
+Optional: run via Docker (closer to Cloud Run, but slower to rebuild):
+
+```powershell
+.\scripts\run-local-docker.ps1 -Port 8080
+```
+
 ## After deploy (configure integrations)
 
 ### Vertex (Marketing assets + optional chat polish)
