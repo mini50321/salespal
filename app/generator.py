@@ -155,6 +155,12 @@ class Generator:
                 sb_list: list[str] | None = None
                 if isinstance(storyboard, list):
                     sb_list = [str(x) for x in storyboard if x is not None and str(x).strip()]
+                cap_raw = opt.get("video_segment_overlays")
+                cap_list: list[str] | None = None
+                if isinstance(cap_raw, list) and cap_raw:
+                    cap_list = [str(x) if x is not None else "" for x in cap_raw]
+                    if not any(x.strip() for x in cap_list):
+                        cap_list = None
                 payload = generate_long_video_stitched(
                     project_id=project,
                     location=vid_region,
@@ -169,6 +175,7 @@ class Generator:
                     generate_audio=bool(generate_audio) if isinstance(generate_audio, bool) else None,
                     continuity_text=str(continuity_text) if isinstance(continuity_text, str) and continuity_text.strip() else None,
                     storyboard=sb_list,
+                    segment_captions=cap_list,
                 )
             else:
                 ds = int(duration_seconds) if isinstance(duration_seconds, (int, float)) and int(duration_seconds) > 0 else None

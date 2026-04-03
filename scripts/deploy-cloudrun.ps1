@@ -40,7 +40,8 @@ $envVars = @(
   "VERTEX_VIDEO_REGION=$Region",
   "STORE_BACKEND=$StoreBackend",
   "GENERATOR_BACKEND=$GeneratorBackend",
-  "CONVERSATION_REPLY_BACKEND=$ConversationReplyBackend"
+  "CONVERSATION_REPLY_BACKEND=$ConversationReplyBackend",
+  "DEMO_UI_ENABLED=1"
 )
 if ($MediaBucket.Trim()) {
   $envVars += "META_MEDIA_BUCKET=$($MediaBucket.Trim())"

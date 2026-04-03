@@ -54,6 +54,65 @@ def _download_video_to_file(client: storage.Client, item: dict[str, Any], path: 
     raise RuntimeError("video item empty (missing gcs_uri/bytes_base64)")
 
 
+def _default_caption_font_path() -> str:
+    for p in (
+        (os.getenv("VERTEX_VIDEO_CAPTION_FONT") or "").strip(),
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    ):
+        if p and os.path.isfile(p):
+            return p
+    return ""
+
+
+def _burn_caption_on_video(src: str, dst: str, caption: str) -> None:
+    """
+    Pixel-accurate caption overlay (exact spelling). Veo cannot render reliable text; we burn in after generation.
+    """
+    cap = (caption or "").strip()
+    if not cap:
+        import shutil
+
+        shutil.copyfile(src, dst)
+        return
+    fontsize = int((os.getenv("VERTEX_VIDEO_CAPTION_FONTSIZE") or "38").strip() or "38")
+    if len(cap) > 48:
+        fontsize = max(22, fontsize - min(14, (len(cap) - 48) // 6))
+    margin = int((os.getenv("VERTEX_VIDEO_CAPTION_MARGIN_BOTTOM") or "68").strip() or "68")
+    font = _default_caption_font_path()
+    font_ff = font.replace("\\", "/") if font else ""
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, suffix=".txt", newline="\n") as tf:
+        tf.write(cap)
+        if not cap.endswith("\n"):
+            tf.write("\n")
+        text_path = tf.name
+    text_ff = text_path.replace("\\", "/")
+    try:
+        if font_ff:
+            vf = (
+                f"drawtext=fontfile={font_ff}:textfile={text_ff}:fontsize={fontsize}:"
+                f"fontcolor=white:borderw=2:bordercolor=black@0.85:"
+                f"x=(w-text_w)/2:y=h-text_h-{margin}:"
+                f"box=1:boxcolor=black@0.55:boxborderw=14:line_spacing=10"
+            )
+        else:
+            vf = (
+                f"drawtext=textfile={text_ff}:fontsize={fontsize}:"
+                f"fontcolor=white:borderw=2:bordercolor=black@0.85:"
+                f"x=(w-text_w)/2:y=h-text_h-{margin}:"
+                f"box=1:boxcolor=black@0.55:boxborderw=14:line_spacing=10"
+            )
+        cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", src, "-vf", vf, "-codec:a", "copy", dst]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError((r.stderr or r.stdout or "ffmpeg drawtext failed").strip())
+    finally:
+        try:
+            os.unlink(text_path)
+        except OSError:
+            pass
+
+
 def _concat_mp4_ffmpeg(paths: list[str], out_path: str) -> None:
     # Prefer re-encode for robustness (clips may differ).
     with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8", suffix=".txt") as tf:
@@ -129,6 +188,7 @@ def generate_long_video_stitched(
     generate_audio: bool | None = None,
     continuity_text: str | None = None,
     storyboard: list[str] | None = None,
+    segment_captions: list[str] | None = None,
 ) -> dict[str, Any]:
     """
     Build a long video by generating multiple short clips and stitching them.
@@ -152,6 +212,23 @@ def generate_long_video_stitched(
 
     cont = (continuity_text or "").strip()
     sb = [str(x).strip() for x in (storyboard or []) if isinstance(x, (str, int, float)) and str(x).strip()]
+    caps_raw = segment_captions or []
+    caps: list[str] = []
+    for x in caps_raw:
+        if isinstance(x, (str, int, float)):
+            caps.append(str(x))
+        else:
+            caps.append("")
+    burn_in = os.getenv("VERTEX_VIDEO_BURN_IN_CAPTIONS", "1").strip().lower() not in ("0", "false", "no")
+    burn_in = burn_in and bool(any(str(x).strip() for x in caps))
+    if burn_in:
+        cont = (
+            "CRITICAL — NO ON-SCREEN TYPOGRAPHY IN GENERATED PIXELS: Do not draw any readable words, captions, titles, "
+            "logotypes, or UI labels in the video. Keep the lower third visually empty or a soft unfocused gradient only. "
+            "Monitors and phones must stay abstract/blurred with no legible characters. Exact captions are composited "
+            "after generation.\n\n"
+            + cont
+        )
     clip_items: list[dict[str, Any]] = []
     segment_prompts: list[str] = []
     for i in range(segs):
@@ -172,6 +249,13 @@ def generate_long_video_stitched(
             seg_prompt = f"{seg_prompt}\n\nContinuity constraints (keep consistent across all segments):\n{cont}"
         if segs > 1:
             seg_prompt = f"{seg_prompt}\n\nScene {i+1} of {segs}: {seg_desc}"
+        cap_i = caps[i].strip() if i < len(caps) else ""
+        if cap_i and not burn_in:
+            safe = cap_i.replace("\\", " ").replace('"', "'")[:500]
+            seg_prompt = (
+                f'{seg_prompt}\n\nSEGMENT_CAPTION (this clip only — one placement, bottom-center or lower-third; '
+                f'no duplicate side titles; no other readable text in-scene). Verbatim caption text: "{safe}"'
+            )
         segment_prompts.append(seg_prompt)
         out = generate_videos_veo(
             project_id=project_id,
@@ -199,9 +283,15 @@ def generate_long_video_stitched(
     with tempfile.TemporaryDirectory(prefix="salespal_veo_") as td:
         clip_paths: list[str] = []
         for idx, item in enumerate(clip_items):
-            p = os.path.join(td, f"clip_{idx:03d}.mp4")
-            _download_video_to_file(client, item, p)
-            clip_paths.append(p)
+            p_raw = os.path.join(td, f"clip_{idx:03d}.mp4")
+            _download_video_to_file(client, item, p_raw)
+            cap_i = caps[idx].strip() if idx < len(caps) else ""
+            if burn_in and cap_i:
+                p_cap = os.path.join(td, f"clip_{idx:03d}_captioned.mp4")
+                _burn_caption_on_video(p_raw, p_cap, cap_i)
+                clip_paths.append(p_cap)
+            else:
+                clip_paths.append(p_raw)
         stitched_path = os.path.join(td, "stitched.mp4")
         _concat_mp4_ffmpeg(clip_paths, stitched_path)
         obj = f"salespal-assets/stitched_{int(time.time())}_{segs}x{clip}s.mp4"
@@ -215,6 +305,7 @@ def generate_long_video_stitched(
         "clip_seconds": clip,
         "segments": segs,
         "segment_prompts": segment_prompts,
+        "caption_burn_in": burn_in,
         "videos": [{"mime_type": "video/mp4", "gcs_uri": stitched_gs}],
     }
 
@@ -298,11 +389,21 @@ def generate_videos_veo(
                     item["gcs_uri"] = v["gcsUri"]
                 if v.get("bytesBase64Encoded"):
                     item["bytes_base64"] = v["bytesBase64Encoded"]
-                videos_out.append(item)
+                if item.get("gcs_uri") or item.get("bytes_base64"):
+                    videos_out.append(item)
+            rai_n = resp.get("raiMediaFilteredCount")
+            if not videos_out:
+                hint = (
+                    " Vertex often returns an empty list when every sample was removed by safety/RAI filters "
+                    "(see raiMediaFilteredCount). Retry with a shorter segment prompt, simpler scene, fewer people, "
+                    "or adjust VERTEX_VIDEO_PERSON_GENERATION / negative prompt per your GCP policy."
+                )
+                rai_bit = f"raiMediaFilteredCount={rai_n}. " if rai_n is not None else ""
+                raise RuntimeError("veo returned no video segments — " + rai_bit + hint.strip())
             return {
                 "prompt": prompt,
                 "model": model_id,
-                "rai_media_filtered_count": resp.get("raiMediaFilteredCount"),
+                "rai_media_filtered_count": rai_n,
                 "videos": videos_out,
             }
         time.sleep(poll_interval)

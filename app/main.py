@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import html
 import logging
 import os
 
@@ -9,16 +11,24 @@ from .gcp_bootstrap import maybe_load_secrets
 configure_logging()
 maybe_load_secrets()
 
-from flask import Flask, Response, jsonify, request
+from flask import Flask, Response, jsonify, redirect, request
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .creative_assets import (
+    apply_logo_asset_to_prompts,
+    apply_production_plan_to_prompts,
+    apply_script_audio_to_video_plan,
     derive_autonomous_campaign_params,
     derive_imagen_prompts_from_brief,
+    derive_production_plan_from_brief,
+    derive_script_audio_spec,
     derive_video_plan_from_brief,
+    merge_stage5_video_options,
+    stage5_asset_manifest,
 )
-from .creative_brief import generate_creative_brief
+from .campaign_qa import run_stage6_campaign_qa, stage6_pending_placeholder
+from .creative_brief import describe_logo_image, fetch_website_form_hints, generate_creative_brief
 from .generator import Generator
 from .conversation_engine import conversation_to_qualification_dict, process_user_message
 from .persistence import build_conversation_store, build_stores
@@ -59,25 +69,108 @@ zoho = ZohoClient()
 log = logging.getLogger(__name__)
 
 
+def _service_index_payload() -> dict[str, Any]:
+    return {
+        "service": "salespal-api",
+        "status": "ok",
+        "demo_ui": "/demo",
+        "api_json": "/api",
+        "routes": {
+            "api_json": "/api",
+            "healthz": "/healthz",
+            "readyz": "/readyz",
+            "whatsapp_webhook": "/v1/webhooks/whatsapp",
+            "public_chat_start": "/v1/public/chat/start",
+            "public_chat_message": "/v1/public/chat/message",
+            "creative_brief": "/v1/marketing/creative-brief",
+            "fetch_website_hints": "/v1/marketing/fetch-website-hints",
+            "creative_assets": "/v1/marketing/creative-assets",
+            "marketing_campaign": "/v1/marketing/campaign",
+            "marketing_campaign_execute": "/v1/marketing/campaign/execute",
+        },
+    }
+
+
+def _index_browser_html() -> str:
+    data = _service_index_payload()
+    routes = data["routes"]
+    items = "".join(
+        "<li><code>{0}</code> — <code>{1}</code></li>".format(html.escape(k), html.escape(str(v)))
+        for k, v in sorted(routes.items())
+    )
+    if not _demo_ui_enabled():
+        demo_note = (
+            "<p class=\"muted\"><strong>Demo UI is off.</strong> Set environment variable "
+            "<code>DEMO_UI_ENABLED=1</code> and restart (local script does this by default).</p>"
+        )
+    elif (os.getenv("DEMO_UI_KEY") or "").strip():
+        demo_note = (
+            "<p class=\"muted\">Demo requires <code>?key=…</code> on <code>/demo</code> "
+            "(same value as <code>DEMO_UI_KEY</code>).</p>"
+        )
+    else:
+        demo_note = ""
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SalesPal API</title>
+  <style>
+    body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; max-width: 40rem;
+      margin: 2rem auto; padding: 0 1rem; color: #0f172a; line-height: 1.45; }}
+    a {{ color: #0369a1; }}
+    code {{ background: #f1f5f9; padding: 0.12rem 0.35rem; border-radius: 4px; font-size: 0.88em; }}
+    .muted {{ color: #64748b; font-size: 0.9rem; }}
+    ul {{ padding-left: 1.2rem; }}
+    li {{ margin: 0.25rem 0; }}
+  </style>
+</head>
+<body>
+  <h1 style="font-size:1.35rem">SalesPal API</h1>
+  <p>Service is up.</p>
+  <p style="margin:1.25rem 0"><a href="/demo" style="display:inline-block;background:#0369a1;color:#fff;padding:0.6rem 1.2rem;border-radius:10px;text-decoration:none;font-weight:600">Open campaign demo</a></p>
+  {demo_note}
+  <p class="muted">Machine-readable: <a href="/api">/api</a> · <a href="/?format=json">/?format=json</a> · <a href="/healthz">/healthz</a></p>
+  <h2 style="font-size:1rem;margin-top:1.5rem">Routes</h2>
+  <ul>{items}</ul>
+</body>
+</html>"""
+
+
+def _request_likely_from_browser_tab() -> bool:
+    """
+    True when we should send the user to /demo instead of JSON.
+    curl/scripts use Accept: */* or application/json — no 'text/html' substring.
+    Real browsers send text/html in Accept (and often Sec-Fetch-Dest: document).
+    """
+    if (request.headers.get("Sec-Fetch-Dest") or "").lower() == "document":
+        return True
+    accept = (request.headers.get("Accept") or "").lower()
+    return "text/html" in accept
+
+
+@app.get("/api")
+def api_discovery():
+    """Always JSON — use this URL for scripts and monitoring (no Accept header quirks)."""
+    return jsonify(_service_index_payload())
+
+
 @app.get("/")
 def index():
-    return jsonify(
-        {
-            "service": "salespal-api",
-            "status": "ok",
-            "routes": {
-                "healthz": "/healthz",
-                "readyz": "/readyz",
-                "whatsapp_webhook": "/v1/webhooks/whatsapp",
-                "public_chat_start": "/v1/public/chat/start",
-                "public_chat_message": "/v1/public/chat/message",
-                "creative_brief": "/v1/marketing/creative-brief",
-                "creative_assets": "/v1/marketing/creative-assets",
-                "marketing_campaign": "/v1/marketing/campaign",
-                "marketing_campaign_execute": "/v1/marketing/campaign/execute",
-            },
-        }
-    )
+    data = _service_index_payload()
+    if (request.args.get("format") or "").lower() == "json":
+        return jsonify(data)
+    # Demo on, no key: browsers hitting / go straight to the UI (local + Cloud Run).
+    if (
+        _demo_ui_enabled()
+        and not (os.getenv("DEMO_UI_KEY") or "").strip()
+        and _request_likely_from_browser_tab()
+    ):
+        return redirect("/demo", code=302)
+    if request.accept_mimetypes.best_match(["application/json", "text/html"]) == "text/html":
+        return Response(_index_browser_html(), mimetype="text/html; charset=utf-8")
+    return jsonify(data)
 
 
 @app.after_request
@@ -114,6 +207,89 @@ def _log_request():
 
 def _err(status: int, message: str):
     return jsonify({"error": message}), status
+
+
+_MAX_CAMPAIGN_ON_SCREEN_LINES = 20
+
+
+def _parse_campaign_on_screen_lines(raw: Any) -> list[str]:
+    out: list[str] = []
+    if isinstance(raw, list):
+        for x in raw:
+            s = str(x).strip()
+            if s:
+                out.append(s)
+    elif isinstance(raw, str):
+        for line in raw.splitlines():
+            s = line.strip()
+            if s:
+                out.append(s)
+    return out[:_MAX_CAMPAIGN_ON_SCREEN_LINES]
+
+
+_ALLOWED_LOGO_IMAGE_MIMES = frozenset({"image/png", "image/jpeg", "image/webp"})
+
+
+def _parse_logo_image_from_body(body: dict[str, Any]) -> tuple[bytes | None, str | None, str | None]:
+    """Returns (raw_bytes, mime_type, error_message). Empty input → (None, None, None)."""
+    raw = body.get("logo_image_base64")
+    if raw is None or raw == "":
+        return None, None, None
+    if not isinstance(raw, str) or not raw.strip():
+        return None, None, "logo_image_base64 must be a non-empty string"
+    s = raw.strip()
+    mime = "image/png"
+    if s.startswith("data:"):
+        try:
+            head, b64part = s.split(",", 1)
+            semi = head.find(";")
+            mime = (head[5:semi] if semi > 5 else head[5:]).strip().lower()
+            s = b64part
+        except ValueError:
+            return None, None, "invalid logo_image_base64 data URL"
+    else:
+        declared = body.get("logo_image_mime_type")
+        if isinstance(declared, str) and declared.strip():
+            mime = declared.strip().lower()
+    if mime not in _ALLOWED_LOGO_IMAGE_MIMES:
+        return None, None, "logo_image_mime_type must be image/png, image/jpeg, or image/webp"
+    try:
+        data = base64.b64decode(s, validate=False)
+    except Exception:
+        return None, None, "logo_image_base64 is not valid base64"
+    max_b = int(os.getenv("CAMPAIGN_LOGO_IMAGE_MAX_BYTES") or str(2_500_000))
+    if len(data) > max_b:
+        return None, None, f"logo image too large (max {max_b} bytes)"
+    if len(data) < 32:
+        return None, None, "logo image data too small"
+    return data, mime, None
+
+
+def _normalize_primary_market(raw: Any) -> str:
+    default = (os.getenv("CAMPAIGN_DEFAULT_PRIMARY_MARKET") or "India").strip() or "India"
+    if raw is None:
+        return default
+    s = str(raw).strip()
+    return s if s else default
+
+
+def _primary_market_is_india(pm: str) -> bool:
+    s = (pm or "").strip().lower()
+    if not s:
+        return False
+    if s in ("in", "ind", "india", "bharat"):
+        return True
+    return "india" in s or "indian" in s or "south asia" in s
+
+
+_INDIA_CASTING_DIRECTION = (
+    "Indian and South Asian adult professionals (mixed gender, credible ages ~28–55) in contemporary Indian metro corporate "
+    "or tier-1 business settings; wardrobe and context must read as India-paid-social authentic — not Western-only default casting."
+)
+_INDIA_MARKETING_LOCALIZATION = (
+    "India digital ads (Meta/LinkedIn/YouTube): ground messaging in credible local buyer segments; Indian English VO is acceptable; "
+    "subtle corporate music bed; avoid all-foreign team tropes when primary buyers are Indian."
+)
 
 
 def _demo_ui_enabled() -> bool:
@@ -621,6 +797,92 @@ def demo_ui():
         color: var(--text);
       }
       .chk-row input { width: auto; margin: 0; }
+      .studio-toggle-card {
+        margin-top: 0.85rem;
+        padding: 0.9rem 1rem;
+        border-radius: 12px;
+        border: 1px solid var(--border);
+        background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%);
+        box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+      }
+      label.studio-toggle-label {
+        display: flex;
+        align-items: flex-start;
+        gap: 0.75rem;
+        margin: 0;
+        cursor: pointer;
+        text-transform: none;
+        letter-spacing: normal;
+        font-weight: 400;
+        color: var(--text);
+      }
+      .studio-toggle-input {
+        width: 1.125rem;
+        height: 1.125rem;
+        min-width: 1.125rem;
+        margin: 0.2rem 0 0 0;
+        flex-shrink: 0;
+        accent-color: var(--accent);
+        cursor: pointer;
+      }
+      .studio-toggle-body {
+        display: flex;
+        flex-direction: column;
+        gap: 0.3rem;
+        min-width: 0;
+        flex: 1;
+      }
+      .studio-toggle-title {
+        font-size: 0.9375rem;
+        font-weight: 600;
+        color: var(--text);
+        letter-spacing: -0.015em;
+        line-height: 1.35;
+      }
+      .studio-toggle-desc {
+        font-size: 0.8125rem;
+        font-weight: 400;
+        color: var(--muted);
+        line-height: 1.5;
+        max-width: 42rem;
+      }
+      .visually-hidden {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        padding: 0;
+        margin: -1px;
+        overflow: hidden;
+        clip: rect(0, 0, 0, 0);
+        white-space: nowrap;
+        border: 0;
+      }
+      .studio-fetch-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.5rem;
+        align-items: stretch;
+        margin-top: 0.35rem;
+      }
+      .studio-fetch-row input[type="text"],
+      .studio-fetch-row input[type="url"] {
+        flex: 1;
+        min-width: 12rem;
+      }
+      .studio-advanced-hint {
+        margin-top: 0.75rem;
+        font-size: 0.8125rem;
+        color: var(--muted);
+      }
+      .studio-advanced-hint summary {
+        cursor: pointer;
+        font-weight: 600;
+        color: var(--text);
+        list-style: none;
+      }
+      .studio-advanced-hint summary::-webkit-details-marker { display: none; }
+      .studio-advanced-hint[open] summary { margin-bottom: 0.5rem; }
+      .studio-advanced-hint .hint { margin-top: 0; }
       .btn-generate-campaign {
         margin-top: 1.1rem;
         width: 100%;
@@ -649,6 +911,62 @@ def demo_ui():
         letter-spacing: 0.06em;
         color: var(--accent);
         margin-bottom: 0.45rem;
+      }
+      .api-out-details {
+        margin-top: 0.85rem;
+        border-radius: 10px;
+        border: 1px solid var(--border);
+        background: #0f172a;
+        overflow: hidden;
+      }
+      .api-out-details summary {
+        cursor: pointer;
+        list-style: none;
+        padding: 0.55rem 0.75rem;
+        font-size: 0.8125rem;
+        font-weight: 600;
+        color: #e2e8f0;
+        background: #1e293b;
+        display: flex;
+        align-items: center;
+        gap: 0.45rem;
+      }
+      .api-out-details summary::-webkit-details-marker { display: none; }
+      .api-out-details summary::before {
+        content: "▸";
+        font-size: 0.65rem;
+        opacity: 0.8;
+      }
+      .api-out-details[open] summary::before { content: "▾"; }
+      .api-out-badge {
+        font-size: 0.65rem;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: #94a3b8;
+        margin-left: auto;
+      }
+      pre#out.api-out-pre {
+        margin: 0;
+        max-height: min(38vh, 320px);
+        overflow: auto;
+        padding: 0.75rem;
+        font-size: 0.75rem;
+        line-height: 1.45;
+        background: #0f172a;
+        color: #e2e8f0;
+        border: none;
+        border-radius: 0;
+      }
+      .campaign-job-err {
+        padding: 0.6rem 0.75rem;
+        margin-top: 0.5rem;
+        border-radius: 8px;
+        background: #fef2f2;
+        border: 1px solid #fecaca;
+        color: #991b1b;
+        font-size: 0.8125rem;
+        line-height: 1.45;
       }
     </style>
   </head>
@@ -736,18 +1054,46 @@ def demo_ui():
             <div class="card-h">
               <div>
                 <h3>Generate full campaign</h3>
-                <span>One source · AI plans formats &amp; length</span>
+                <span>Add one source — AI picks formats</span>
               </div>
             </div>
-            <p class="studio-lead">Paste notes, a page URL, or upload a PDF. Choose vertical or landscape for video. Carousel depth and video duration are chosen from your content — you do not write prompts.</p>
+            <p class="studio-lead">Text, link, or PDF below. Optional brand fields help the AI; leave them blank if you prefer.</p>
             <label>What are you adding?</label>
             <div class="source-pills" id="studio_source_pills">
               <label><input type="radio" name="studio_source" value="text" checked /><span>Brief text</span></label>
               <label><input type="radio" name="studio_source" value="url" /><span>Website URL</span></label>
               <label><input type="radio" name="studio_source" value="pdf" /><span>PDF document</span></label>
             </div>
+            <label>Brand (optional)</label>
+            <label for="studio_fetch_url" class="visually-hidden">Page URL to auto-fill brand fields</label>
+            <div class="studio-fetch-row" id="studio-fetch-anchor">
+              <input id="studio_fetch_url" type="text" inputmode="url" placeholder="Paste URL to auto-fill brand →" autocomplete="url" aria-label="URL to fetch brand hints from" />
+              <button type="button" class="btn-secondary" id="btn-fetch-website" onclick="fetchWebsiteHints()">Fetch</button>
+            </div>
+            <label for="studio_brand_name">Brand name</label>
+            <input id="studio_brand_name" type="text" placeholder="Company or product name" autocomplete="organization" />
+            <label for="studio_brand_tagline">Tagline</label>
+            <input id="studio_brand_tagline" type="text" placeholder="Optional slogan" autocomplete="off" />
+            <label for="studio_logo_text">Logo text</label>
+            <input id="studio_logo_text" type="text" placeholder="Short text on screen (e.g. ACME)" autocomplete="off" />
+            <label for="studio_logo_image">Logo file</label>
+            <input id="studio_logo_image" type="file" accept="image/png,image/jpeg,image/jpg,image/webp,.png,.jpg,.jpeg,.webp" />
+            <label for="studio_primary_market">Market</label>
+            <input id="studio_primary_market" type="text" value="India" placeholder="Country / region" autocomplete="off" />
+            <label for="studio_objective">Objective</label>
+            <input id="studio_objective" type="text" placeholder="e.g. Leads, awareness, installs" autocomplete="off" />
+            <label for="studio_on_screen_lines">Exact lines on video (optional)</label>
+            <textarea id="studio_on_screen_lines" style="min-height:72px" placeholder="One line per row — copied exactly on video" autocomplete="off"></textarea>
+            <div class="studio-toggle-card">
+              <label class="studio-toggle-label" for="studio_logo_persistent">
+                <input class="studio-toggle-input" id="studio_logo_persistent" type="checkbox" checked />
+                <span class="studio-toggle-body">
+                  <span class="studio-toggle-title">Show logo on every video clip</span>
+                </span>
+              </label>
+            </div>
             <label for="studio_text" id="studio_text_label">Your brief or notes</label>
-            <textarea id="studio_text" style="min-height:140px" placeholder="Describe the product, who it is for, key benefits, tone, and any visual preferences. Or paste a full URL if you chose Website above."></textarea>
+            <textarea id="studio_text" style="min-height:120px" placeholder="Product, audience, benefits, tone — or one URL if &quot;Website URL&quot; is selected" autocomplete="off"></textarea>
             <label for="studio_pdf" id="studio_pdf_label" hidden>PDF file</label>
             <input type="file" id="studio_pdf" accept="application/pdf,.pdf" hidden />
             <label>Video shape</label>
@@ -769,19 +1115,39 @@ def demo_ui():
             <div class="chk-row" style="flex-direction:column;align-items:flex-start;gap:0.5rem">
               <div class="chk-row" style="margin-top:0">
                 <input type="checkbox" id="studio_gen_image" checked />
-                <label for="studio_gen_image" style="margin:0;text-transform:none;font-weight:500;letter-spacing:normal">Image ad (single still)</label>
+                <label for="studio_gen_image" style="margin:0;text-transform:none;font-weight:500;letter-spacing:normal">Image ad</label>
+              </div>
+              <div class="chk-row" style="margin-top:0;gap:0.6rem;align-items:center">
+                <label for="studio_image_n" style="margin:0;text-transform:none;font-weight:500;letter-spacing:normal;min-width:9rem"># images</label>
+                <input id="studio_image_n" type="number" min="1" max="10" step="1" value="1" style="width:6.5rem" />
               </div>
               <div class="chk-row" style="margin-top:0">
                 <input type="checkbox" id="studio_gen_carousel" checked />
-                <label for="studio_gen_carousel" style="margin:0;text-transform:none;font-weight:500;letter-spacing:normal">Carousel (multiple panels)</label>
+                <label for="studio_gen_carousel" style="margin:0;text-transform:none;font-weight:500;letter-spacing:normal">Carousel</label>
+              </div>
+              <div class="chk-row" style="margin-top:0;gap:0.6rem;align-items:center">
+                <label for="studio_carousel_n" style="margin:0;text-transform:none;font-weight:500;letter-spacing:normal;min-width:9rem"># carousel slides</label>
+                <input id="studio_carousel_n" type="number" min="3" max="10" step="1" value="5" style="width:6.5rem" />
               </div>
               <div class="chk-row" style="margin-top:0">
                 <input type="checkbox" id="studio_gen_video" checked />
-                <label for="studio_gen_video" style="margin:0;text-transform:none;font-weight:500;letter-spacing:normal">Long stitched video (can take several minutes — keep this page open)</label>
+                <label for="studio_gen_video" style="margin:0;text-transform:none;font-weight:500;letter-spacing:normal">Long video (slow — keep page open)</label>
+              </div>
+              <div class="chk-row" style="margin-top:0;gap:0.6rem;align-items:center">
+                <label for="studio_video_minutes" style="margin:0;text-transform:none;font-weight:500;letter-spacing:normal;min-width:9rem">Video length</label>
+                <select id="studio_video_minutes" style="width:10.5rem">
+                  <option value="0.5">0.5 min (30s)</option>
+                  <option value="1" selected>1 min (60s)</option>
+                  <option value="2">2 min (120s)</option>
+                </select>
               </div>
             </div>
+            <p class="hint" id="studio_credit_hint" style="margin-top:0.65rem">Estimated credits: —</p>
             <button type="button" class="btn-primary btn-generate-campaign" id="btn-campaign" onclick="runAutonomousCampaign()">Generate campaign</button>
-            <p class="hint">Uses <code>POST /v1/marketing/campaign</code> (plan) then <code>POST /v1/marketing/campaign/execute</code> (assets). Video needs <code>META_MEDIA_BUCKET</code> on the service and a long browser wait.</p>
+            <details class="studio-advanced-hint">
+              <summary>API &amp; video notes</summary>
+              <p class="hint">Uses <code>POST /v1/marketing/campaign</code> then <code>/execute</code>. Video needs bucket config on the service. Lines under “Exact lines on video” are <strong>burned in with FFmpeg</strong> (Veo cannot typeset reliably). Override: <code>VERTEX_VIDEO_BURN_IN_CAPTIONS=0</code>.</p>
+            </details>
           </div>
         </div>
 
@@ -793,7 +1159,7 @@ def demo_ui():
                 <span>Brief, plan &amp; previews</span>
               </div>
             </div>
-            <p class="hint" style="margin:0">Structured response and previews. Video runs may take several minutes.</p>
+            <p class="hint" style="margin:0">Plans, QA, and video/image previews show above. Expand <strong>Full API response</strong> for raw JSON (opens automatically if a job failed).</p>
             <div id="gen-loading-root" class="gen-loading-root" hidden aria-live="polite" aria-busy="false">
               <div class="gen-loading-row">
                 <div class="gen-loading-spinner" aria-hidden="true"></div>
@@ -809,7 +1175,10 @@ def demo_ui():
               <div class="asset-preview-h" id="asset-preview-title">Preview</div>
               <div id="asset-preview-body" class="asset-preview-body"></div>
             </div>
-            <pre id="out">Select an action to view the response.</pre>
+            <details id="out-details" class="api-out-details">
+              <summary class="api-out-summary">Full API response <span class="api-out-badge">JSON</span></summary>
+              <pre id="out" class="api-out-pre">Select an action to view the response.</pre>
+            </details>
           </div>
         </aside>
       </div>
@@ -821,6 +1190,7 @@ def demo_ui():
 
     <script>
       const outEl = document.getElementById('out');
+      const outDetailsEl = document.getElementById('out-details');
       const hintEl = document.getElementById('status-hint');
       const assetPreviewWrap = document.getElementById('asset-preview-wrap');
       const assetPreviewBody = document.getElementById('asset-preview-body');
@@ -923,15 +1293,49 @@ def demo_ui():
         var titleEl = document.getElementById('asset-preview-title');
         if (titleEl) titleEl.textContent = 'Campaign preview';
         var plan = data.prompts_used && data.prompts_used.autonomous_plan;
+        var prod = data.prompts_used && data.prompts_used.production_plan;
+        var sa = data.prompts_used && data.prompts_used.script_audio;
         var chunks = [];
         if (plan && plan.planning_rationale) {
           chunks.push('<div class="campaign-plan-note"><strong>AI plan</strong> · ' + escapeHtml(plan.planning_rationale) + '</div>');
+        }
+        if (prod && prod.one_line_summary) {
+          chunks.push('<div class="campaign-plan-note"><strong>Production plan</strong> · ' + escapeHtml(prod.one_line_summary) + '</div>');
+        }
+        if (sa && sa.one_line_audio_summary) {
+          chunks.push('<div class="campaign-plan-note"><strong>Script &amp; audio</strong> · ' + escapeHtml(sa.one_line_audio_summary) + '</div>');
+        }
+        if (data.stage5 && data.stage5.jobs && data.stage5.jobs.length) {
+          var st = data.stage5.status ? String(data.stage5.status) : '';
+          var parts = data.stage5.jobs.map(function (j) {
+            if (!j || !j.asset_type) return '';
+            if (j.count) return j.asset_type + ' ×' + j.count;
+            if (j.panels) return j.asset_type + ' ×' + j.panels;
+            if (j.veo_segments) return j.asset_type + ' (' + j.veo_segments + ' clips)';
+            return j.asset_type;
+          }).filter(Boolean);
+          var line = '<strong>Stage 5</strong> · ' + parts.join(', ') + (st ? ' · ' + st : '');
+          chunks.push('<div class="campaign-plan-note">' + line + '</div>');
+        }
+        if (data.stage6) {
+          var s6 = data.stage6;
+          if (s6.overall_status) {
+            var s6sum = (s6.llm_review && s6.llm_review.client_summary) ? s6.llm_review.client_summary : '';
+            var s6line = '<strong>Stage 6 QA</strong> · ' + escapeHtml(String(s6.overall_status));
+            if (s6sum) s6line += ' · ' + escapeHtml(s6sum);
+            if (s6.issues && s6.issues.length) s6line += ' (' + s6.issues.length + ' issue(s))';
+            chunks.push('<div class="campaign-plan-note">' + s6line + '</div>');
+          } else if (s6.message) {
+            chunks.push('<div class="campaign-plan-note"><strong>Stage 6</strong> · ' + escapeHtml(String(s6.message)) + '</div>');
+          }
         }
         (data.jobs || []).forEach(function (job) {
           if (!isAssetJob(job)) return;
           var label = String(job.asset_type || 'asset').toUpperCase();
           var inner = buildPreviewPartsFromOutput(job.output).join('');
-          var err = job.status === 'failed' && job.error ? '<p class="asset-preview-empty">' + escapeHtml(job.error) + '</p>' : '';
+          var err = job.status === 'failed' && job.error
+            ? '<div class="campaign-job-err" role="alert">' + escapeHtml(job.error) + '</div>'
+            : '';
           if (inner || err) chunks.push('<div class="campaign-job-block"><div class="campaign-job-h">' + label + '</div>' + inner + err + '</div>');
         });
         if (!chunks.length) {
@@ -943,7 +1347,15 @@ def demo_ui():
       }
       function show(obj) {
         outEl.textContent = (typeof obj === 'string') ? obj : JSON.stringify(obj, null, 2);
-        if (obj && typeof obj === 'object' && obj.brief && Array.isArray(obj.jobs)) {
+        var isCampaign = obj && typeof obj === 'object' && obj.brief && Array.isArray(obj.jobs);
+        if (outDetailsEl) {
+          outDetailsEl.open = !isCampaign;
+        }
+        if (isCampaign) {
+          var hasFail = (obj.jobs || []).some(function (j) { return j && j.status === 'failed'; });
+          if (outDetailsEl) {
+            outDetailsEl.open = !!hasFail;
+          }
           renderCampaignPreview(obj);
           return;
         }
@@ -1076,6 +1488,74 @@ def demo_ui():
         show(data);
         } finally { setBusy('btn-zoho', false); }
       }
+      async function fetchWebsiteHints() {
+        var fetchIn = document.getElementById('studio_fetch_url');
+        var ta = document.getElementById('studio_text');
+        var bn = document.getElementById('studio_brand_name');
+        var raw = fetchIn && (fetchIn.value || '').trim();
+        if (!raw && bn) {
+          var bv = (bn.value || '').trim();
+          var bvl = bv.toLowerCase();
+          if (bvl.indexOf('http://') === 0 || bvl.indexOf('https://') === 0) raw = bv;
+        }
+        if (!raw && studioSourceType() === 'url' && ta) {
+          var tv = (ta.value || '').trim();
+          var firstLine = tv;
+          var ix = firstLine.indexOf("\\n");
+          if (ix >= 0) firstLine = firstLine.slice(0, ix);
+          ix = firstLine.indexOf("\\r");
+          if (ix >= 0) firstLine = firstLine.slice(0, ix);
+          var fll = firstLine.toLowerCase();
+          if (fll.indexOf('http://') === 0 || fll.indexOf('https://') === 0) raw = firstLine.trim();
+        }
+        if (!raw) {
+          show('Enter a URL in the fetch field, paste a URL in Brand name, or choose Website URL and put the URL in the source field.');
+          hintEl.textContent = '';
+          return;
+        }
+        setBusy('btn-fetch-website', true);
+        hintEl.textContent = 'Reading website…';
+        try {
+          var data = await callJson('/v1/marketing/fetch-website-hints', { url: raw });
+          if (data._http) {
+            show(data);
+            return;
+          }
+          if (bn && data.brand_name) bn.value = data.brand_name;
+          var bt = document.getElementById('studio_brand_tagline');
+          if (bt && data.brand_tagline) bt.value = data.brand_tagline;
+          var lt = document.getElementById('studio_logo_text');
+          if (lt && data.logo_text) lt.value = data.logo_text;
+          var ob = document.getElementById('studio_objective');
+          if (ob && data.objective) ob.value = data.objective;
+          if (data.campaign_summary && ta) {
+            var st = studioSourceType();
+            if (st === 'url') {
+              var urlPill = document.querySelector('input[name="studio_source"][value="url"]');
+              if (urlPill) urlPill.checked = true;
+              toggleStudioSource();
+              ta.value = (data.url || raw).trim();
+            } else {
+              var cur = (ta.value || '').trim();
+              if (!cur) ta.value = data.campaign_summary;
+              else ta.value = cur + "\\n\\n" + data.campaign_summary;
+            }
+          } else if (studioSourceType() === 'url' && ta && (data.url || raw)) {
+            var urlPill2 = document.querySelector('input[name="studio_source"][value="url"]');
+            if (urlPill2) urlPill2.checked = true;
+            toggleStudioSource();
+            ta.value = (data.url || raw).trim();
+          }
+          if (fetchIn && !(fetchIn.value || '').trim()) fetchIn.value = (data.url || raw).trim();
+          show(data);
+          hintEl.textContent = 'Filled from website · HTTP 200';
+        } catch (e) {
+          show(String(e));
+          hintEl.textContent = '';
+        } finally {
+          setBusy('btn-fetch-website', false);
+        }
+      }
       function studioSourceType() {
         var el = document.querySelector('input[name="studio_source"]:checked');
         return el ? el.value : 'text';
@@ -1100,6 +1580,51 @@ def demo_ui():
         }
         lab.textContent = st === 'url' ? 'Website URL' : 'Your brief or notes';
       }
+
+      function clampInt(v, minV, maxV, fallback) {
+        var n = parseInt(String(v || ''), 10);
+        if (isNaN(n)) n = fallback;
+        if (typeof minV === 'number') n = Math.max(minV, n);
+        if (typeof maxV === 'number') n = Math.min(maxV, n);
+        return n;
+      }
+      function parseMinutes(v, fallback) {
+        var n = parseFloat(String(v || ''));
+        if (!isFinite(n) || n <= 0) return fallback;
+        return n;
+      }
+      function estimatedCredits(genImage, imageN, genCarousel, carouselN, genVideo, videoSeconds, clipSeconds) {
+        // Heuristic estimate only; real billing depends on provider.
+        var c = 0;
+        if (genImage) c += Math.max(1, imageN || 1);
+        if (genCarousel) c += Math.max(1, carouselN || 3);
+        if (genVideo) {
+          var clips = Math.max(1, Math.ceil((videoSeconds || 60) / Math.max(1, clipSeconds || 6)));
+          c += clips * 5; // assume video clips are more expensive than a single image
+        }
+        return c;
+      }
+      function updateCreditHint() {
+        var el = document.getElementById('studio_credit_hint');
+        if (!el) return;
+        var gImg = document.getElementById('studio_gen_image');
+        var gCar = document.getElementById('studio_gen_carousel');
+        var gVid = document.getElementById('studio_gen_video');
+        var genImage = gImg ? gImg.checked : true;
+        var genCarousel = gCar ? gCar.checked : true;
+        var genVideo = gVid ? gVid.checked : true;
+        var imageN = clampInt(document.getElementById('studio_image_n') && document.getElementById('studio_image_n').value, 1, 10, 1);
+        var carouselN = clampInt(document.getElementById('studio_carousel_n') && document.getElementById('studio_carousel_n').value, 3, 10, 5);
+        var minutes = parseMinutes(document.getElementById('studio_video_minutes') && document.getElementById('studio_video_minutes').value, 1);
+        var videoSeconds = Math.round(minutes * 60);
+        var clipSeconds = 6;
+        var credits = estimatedCredits(genImage, imageN, genCarousel, carouselN, genVideo, videoSeconds, clipSeconds);
+        var parts = [];
+        if (genImage) parts.push(imageN + ' image' + (imageN === 1 ? '' : 's'));
+        if (genCarousel) parts.push(carouselN + ' slide' + (carouselN === 1 ? '' : 's'));
+        if (genVideo) parts.push(videoSeconds + 's video');
+        el.textContent = 'Estimated credits: ' + credits + (parts.length ? ' · ' + parts.join(' + ') : '');
+      }
       async function runAutonomousCampaign() {
         setBusy('btn-campaign', true);
         var aspectEl = document.querySelector('input[name="studio_aspect"]:checked');
@@ -1117,6 +1642,10 @@ def demo_ui():
           return;
         }
         var st = studioSourceType();
+        var imageN = clampInt(document.getElementById('studio_image_n') && document.getElementById('studio_image_n').value, 1, 10, 1);
+        var carouselN = clampInt(document.getElementById('studio_carousel_n') && document.getElementById('studio_carousel_n').value, 3, 10, 5);
+        var minutes = parseMinutes(document.getElementById('studio_video_minutes') && document.getElementById('studio_video_minutes').value, 1);
+        var videoTotalSeconds = Math.round(minutes * 60);
         var ta = document.getElementById('studio_text');
         var studioVal = ta ? ta.value.trim() : '';
         if (st === 'pdf') {
@@ -1158,7 +1687,42 @@ def demo_ui():
             generate_carousel: genCarousel,
             generate_video: genVideo,
             plan_only: true,
+            image_n: imageN,
+            carousel_n: carouselN,
+            video_total_seconds: videoTotalSeconds,
+            video_clip_seconds: 6,
           };
+          var bn = document.getElementById('studio_brand_name');
+          var bt = document.getElementById('studio_brand_tagline');
+          var lt = document.getElementById('studio_logo_text');
+          var ob = document.getElementById('studio_objective');
+          if (bn && (bn.value || '').trim()) body.brand_name = (bn.value || '').trim();
+          if (bt && (bt.value || '').trim()) body.brand_tagline = (bt.value || '').trim();
+          if (lt && (lt.value || '').trim()) body.logo_text = (lt.value || '').trim();
+          if (ob && (ob.value || '').trim()) body.objective = (ob.value || '').trim();
+          var pmEl = document.getElementById('studio_primary_market');
+          if (pmEl && (pmEl.value || '').trim()) body.primary_market = (pmEl.value || '').trim();
+          var osl = document.getElementById('studio_on_screen_lines');
+          var lpp = document.getElementById('studio_logo_persistent');
+          if (osl && (osl.value || '').trim()) body.on_screen_lines = (osl.value || '').trim();
+          body.logo_persistent = lpp ? !!lpp.checked : true;
+          var lf = document.getElementById('studio_logo_image');
+          if (lf && lf.files && lf.files[0]) {
+            var logoDataUrl = await new Promise(function (resolve, reject) {
+              var lr = new FileReader();
+              lr.onload = function () { resolve(lr.result); };
+              lr.onerror = reject;
+              lr.readAsDataURL(lf.files[0]);
+            });
+            if (typeof logoDataUrl === 'string') {
+              body.logo_image_base64 = logoDataUrl;
+              var ldSemi = logoDataUrl.indexOf(';');
+              var ldComma = logoDataUrl.indexOf(',');
+              if (ldSemi > 5 && ldComma > ldSemi) {
+                body.logo_image_mime_type = logoDataUrl.slice(5, ldSemi);
+              }
+            }
+          }
           if (st === 'pdf') {
             var f = document.getElementById('studio_pdf').files[0];
             var b64 = await new Promise(function (resolve, reject) {
@@ -1199,6 +1763,7 @@ def demo_ui():
             generate_video: genVideo,
             prompts_used: planData.prompts_used,
           };
+          if (planData.brief) execBody.brief = planData.brief;
           var exec = await callJson('/v1/marketing/campaign/execute', execBody);
           stopAssetGenerationLoading();
           if (exec._http) {
@@ -1207,6 +1772,8 @@ def demo_ui():
             return;
           }
           var merged = Object.assign({}, planData, { jobs: exec.jobs || [], plan_only: false });
+          if (exec.stage5) merged.stage5 = exec.stage5;
+          if (exec.stage6) merged.stage6 = exec.stage6;
           show(merged);
         } catch (e) {
           stopAssetGenerationLoading();
@@ -1220,7 +1787,14 @@ def demo_ui():
       document.querySelectorAll('input[name="studio_source"]').forEach(function (el) {
         el.addEventListener('change', toggleStudioSource);
       });
+      ['studio_gen_image','studio_gen_carousel','studio_gen_video','studio_image_n','studio_carousel_n','studio_video_minutes'].forEach(function (id) {
+        var el = document.getElementById(id);
+        if (!el) return;
+        el.addEventListener('change', updateCreditHint);
+        el.addEventListener('input', updateCreditHint);
+      });
       toggleStudioSource();
+      updateCreditHint();
     </script>
   </body>
 </html>"""
@@ -1385,6 +1959,7 @@ def creative_brief_route():
     brand_id = str(body.get("brand_id") or "demo").strip()
     source_type = str(body.get("source_type") or "").strip().lower()
     brand_hint = str(body.get("brand_hint") or "").strip() or None
+    ad_constraints = body.get("ad_constraints") if isinstance(body.get("ad_constraints"), dict) else None
 
     if not brand_id or len(brand_id) > 64:
         return _err(400, "invalid brand_id")
@@ -1401,12 +1976,17 @@ def creative_brief_route():
     if source_type in ("pdf", "pdf_base64") and (not isinstance(pdf_b64, str) or not pdf_b64.strip()):
         return _err(400, "pdf_base64 required for source_type pdf")
     try:
+        ac_in = dict(ad_constraints) if isinstance(ad_constraints, dict) else {}
+        ac_in["primary_market"] = _normalize_primary_market(
+            body.get("primary_market") or ac_in.get("primary_market")
+        )
         out = generate_creative_brief(
             source_type=source_type,
             text=str(text_v).strip() if isinstance(text_v, str) else None,
             url=str(url_v).strip() if isinstance(url_v, str) else None,
             pdf_base64=str(pdf_b64).strip() if isinstance(pdf_b64, str) else None,
             brand_hint=brand_hint,
+            ad_constraints=ac_in,
         )
         out["brand_id"] = brand_id
         return jsonify(out)
@@ -1416,6 +1996,24 @@ def creative_brief_route():
         return _err(503, str(e))
     except Exception as e:
         log.exception("creative brief route")
+        return _err(500, str(e))
+
+
+@app.post("/v1/marketing/fetch-website-hints")
+def fetch_website_hints_route():
+    """Suggest Studio form fields by fetching public page text and calling Vertex Gemini."""
+    body = request.get_json(force=True, silent=True) or {}
+    url = str(body.get("url") or "").strip()
+    if not url:
+        return _err(400, "url required")
+    try:
+        return jsonify(fetch_website_form_hints(url))
+    except ValueError as e:
+        return _err(400, str(e))
+    except RuntimeError as e:
+        return _err(503, str(e))
+    except Exception as e:
+        log.exception("fetch website hints")
         return _err(500, str(e))
 
 
@@ -1429,6 +2027,13 @@ def marketing_campaign_route():
     brand_id = str(body.get("brand_id") or "demo").strip()
     source_type = str(body.get("source_type") or "").strip().lower()
     brand_hint = str(body.get("brand_hint") or "").strip() or None
+    brand_name = str(body.get("brand_name") or "").strip() or None
+    brand_tagline = str(body.get("brand_tagline") or "").strip() or None
+    logo_text = str(body.get("logo_text") or "").strip() or None
+    objective = str(body.get("objective") or "").strip() or None
+    copy_locked_lines = _parse_campaign_on_screen_lines(body.get("on_screen_lines"))
+    primary_market = _normalize_primary_market(body.get("primary_market"))
+    logo_persistent = True if body.get("logo_persistent") is None else bool(body.get("logo_persistent"))
     video_aspect_ratio = str(body.get("video_aspect_ratio") or "16:9").strip()
     if video_aspect_ratio not in ("9:16", "16:9", "1:1"):
         return _err(400, "video_aspect_ratio must be 9:16, 1:1, or 16:9")
@@ -1461,13 +2066,48 @@ def marketing_campaign_route():
     if source_type in ("pdf", "pdf_base64") and (not isinstance(pdf_b64, str) or not pdf_b64.strip()):
         return _err(400, "pdf_base64 required for source_type pdf")
 
+    logo_bytes, logo_mime, logo_err = _parse_logo_image_from_body(body)
+    if logo_err:
+        return _err(400, logo_err)
+    logo_ctx: dict[str, Any] = {}
+    if logo_bytes:
+        try:
+            logo_ctx = describe_logo_image(image_bytes=logo_bytes, mime_type=logo_mime or "image/png")
+        except Exception:
+            log.exception("campaign logo image vision")
+            logo_ctx = {}
+
     try:
+        ad_constraints: dict[str, Any] = {
+            "brand_name": brand_name,
+            "brand_tagline": brand_tagline,
+            "logo_text": (logo_text or brand_name or brand_id) if brand_id else logo_text,
+            "objective": objective,
+            "must_include_logo": True,
+            "must_sound_like_ad": True,
+            "logo_persistent": logo_persistent,
+            "on_screen_lines_verbatim": copy_locked_lines,
+            "logo_image_supplied": bool(logo_bytes),
+            "primary_market": primary_market,
+        }
+        lv = str(logo_ctx.get("logo_visual_description") or "").strip()
+        if lv:
+            ad_constraints["logo_visual_description"] = lv
+        llt = str(logo_ctx.get("logo_lettering_text") or "").strip()
+        if llt:
+            ad_constraints["logo_lettering_text"] = llt
+        dc = logo_ctx.get("dominant_colors")
+        if isinstance(dc, list) and dc:
+            ad_constraints["logo_dominant_colors"] = [
+                str(x).strip() for x in dc[:5] if str(x).strip()
+            ]
         brief_out = generate_creative_brief(
             source_type=source_type,
             text=str(text_v).strip() if isinstance(text_v, str) else None,
             url=str(url_v).strip() if isinstance(url_v, str) else None,
             pdf_base64=str(pdf_b64).strip() if isinstance(pdf_b64, str) else None,
             brand_hint=brand_hint,
+            ad_constraints=ad_constraints,
         )
     except ValueError as e:
         return _err(400, str(e))
@@ -1481,21 +2121,109 @@ def marketing_campaign_route():
     if not isinstance(brief, dict) or not brief:
         return _err(500, "brief generation returned no brief object")
 
+    arq = brief.get("ad_requirements")
+    if not isinstance(arq, dict):
+        arq = {}
+        brief["ad_requirements"] = arq
+    arq["on_screen_lines_verbatim"] = list(copy_locked_lines)
+    arq["logo_persistent"] = bool(logo_persistent)
+    arq["logo_image_supplied"] = bool(logo_bytes)
+    arq["primary_market"] = primary_market
+    if _primary_market_is_india(primary_market):
+        cd_brief = str(arq.get("casting_direction") or "").strip()
+        arq["casting_direction"] = (
+            (_INDIA_CASTING_DIRECTION + (" " + cd_brief if cd_brief else "")).strip()
+        )
+        ml_brief = str(arq.get("marketing_localization_notes") or "").strip()
+        arq["marketing_localization_notes"] = (
+            (_INDIA_MARKETING_LOCALIZATION + (" " + ml_brief if ml_brief else "")).strip()
+        )
+    if ad_constraints.get("logo_visual_description"):
+        arq["logo_visual_description"] = str(ad_constraints["logo_visual_description"]).strip()
+    if ad_constraints.get("logo_lettering_text"):
+        arq["logo_lettering_text"] = str(ad_constraints["logo_lettering_text"]).strip()
+    elif logo_text:
+        arq["logo_lettering_text"] = logo_text
+    if isinstance(ad_constraints.get("logo_dominant_colors"), list):
+        arq["logo_dominant_colors"] = list(ad_constraints["logo_dominant_colors"])
+
+    ltv = str(arq.get("logo_lettering_text") or "").strip()
+    logo_label_for_plan = (
+        (logo_text or ltv or brand_name or (brand_id if brand_id != "demo" else "") or "").strip() or None
+    )
+
     auto: dict[str, Any] | None = None
     prompts_imagen: dict[str, Any] | None = None
     video_plan: dict[str, Any] | None = None
+    production_plan: dict[str, Any] | None = None
+    script_audio: dict[str, Any] | None = None
     try:
         need_imagen = gen_image or gen_carousel
         need_video_plan = gen_video
         if need_imagen or need_video_plan:
             auto = derive_autonomous_campaign_params(brief)
-            carousel_n = max(3, min(7, int(auto.get("carousel_panel_count") or 4)))
-            v_total = int(auto.get("video_total_seconds") or 32)
-            v_clip = int(auto.get("video_clip_seconds") or 8)
+
+            try:
+                image_n = int(body.get("image_n") or 1)
+            except (TypeError, ValueError):
+                return _err(400, "image_n must be an integer")
+            image_n = max(1, min(10, image_n))
+
+            try:
+                carousel_n = int(body.get("carousel_n") or 0)
+            except (TypeError, ValueError):
+                return _err(400, "carousel_n must be an integer")
+            if carousel_n <= 0:
+                carousel_n = int(auto.get("carousel_panel_count") or 4)
+            carousel_n = max(3, min(10, carousel_n))
+
+            try:
+                v_total = int(body.get("video_total_seconds") or 0)
+            except (TypeError, ValueError):
+                return _err(400, "video_total_seconds must be an integer")
+            if v_total <= 0:
+                v_total = int(auto.get("video_total_seconds") or 32)
+            v_total = max(6, min(600, v_total))
+
+            try:
+                v_clip = int(body.get("video_clip_seconds") or 0)
+            except (TypeError, ValueError):
+                return _err(400, "video_clip_seconds must be an integer")
+            if v_clip <= 0:
+                v_clip = int(auto.get("video_clip_seconds") or 8)
+            v_clip = max(2, min(30, v_clip))
+
+            auto = dict(auto)
+            auto["carousel_panel_count"] = carousel_n
+            auto["video_total_seconds"] = v_total
+            auto["video_clip_seconds"] = v_clip
+            auto["image_n"] = image_n
+
+            production_plan = derive_production_plan_from_brief(
+                brief,
+                carousel_n=carousel_n,
+                total_seconds=v_total,
+                clip_seconds=v_clip,
+                image_n=image_n,
+                gen_image=gen_image,
+                gen_carousel=gen_carousel,
+                gen_video=gen_video,
+                copy_locked_lines=copy_locked_lines,
+                logo_persistent=logo_persistent,
+                logo_label=logo_label_for_plan,
+            )
             if need_imagen:
                 prompts_imagen = derive_imagen_prompts_from_brief(brief, carousel_n=carousel_n)
             if need_video_plan:
                 video_plan = derive_video_plan_from_brief(brief, total_seconds=v_total, clip_seconds=v_clip)
+            apply_production_plan_to_prompts(
+                production_plan,
+                prompts_imagen=prompts_imagen if need_imagen else None,
+                video_plan=video_plan if need_video_plan else None,
+            )
+            if need_video_plan and video_plan is not None and production_plan is not None:
+                script_audio = derive_script_audio_spec(brief, production_plan, video_plan)
+                apply_script_audio_to_video_plan(video_plan, script_audio)
     except ValueError as e:
         return _err(400, str(e))
     except RuntimeError as e:
@@ -1508,12 +2236,31 @@ def marketing_campaign_route():
     img_opts["image_aspect_ratio"] = video_aspect_ratio
 
     prompts_used: dict[str, Any] = {}
+    prompts_used["copy_locked_lines"] = list(copy_locked_lines)
+    prompts_used["logo_persistent"] = bool(logo_persistent)
+    prompts_used["primary_market"] = primary_market
     if auto is not None:
         prompts_used["autonomous_plan"] = auto
+    if production_plan is not None:
+        prompts_used["production_plan"] = production_plan
+    if script_audio is not None:
+        prompts_used["script_audio"] = script_audio
     if prompts_imagen:
         prompts_used.update(prompts_imagen)
+    if auto is not None and isinstance(auto, dict) and auto.get("image_n") is not None:
+        prompts_used["image_n"] = int(auto.get("image_n") or 1)
     if video_plan is not None:
         prompts_used["video"] = video_plan
+
+    prompts_used["logo_image_supplied"] = bool(logo_bytes)
+    if logo_bytes:
+        prompts_used["logo_image_base64"] = base64.b64encode(logo_bytes).decode("ascii")
+        prompts_used["logo_image_mime_type"] = logo_mime
+    prompts_used["logo_visual_description"] = str(arq.get("logo_visual_description") or "").strip()
+    prompts_used["logo_lettering_text"] = str(arq.get("logo_lettering_text") or "").strip()
+    if isinstance(arq.get("logo_dominant_colors"), list):
+        prompts_used["logo_dominant_colors"] = list(arq["logo_dominant_colors"])
+    apply_logo_asset_to_prompts(prompts_used)
 
     if gen_image and not prompts_imagen:
         return _err(500, "image generation requested but imagen planning did not run")
@@ -1521,6 +2268,14 @@ def marketing_campaign_route():
         return _err(500, "carousel generation requested but imagen planning did not run")
     if gen_video and video_plan is None:
         return _err(500, "video generation requested but video planning did not run")
+
+    stage5_pending = stage5_asset_manifest(
+        gen_image=gen_image,
+        gen_carousel=gen_carousel,
+        gen_video=gen_video,
+        prompts_used=prompts_used,
+        status="pending_execute",
+    )
 
     if bool(body.get("plan_only")):
         return jsonify(
@@ -1536,6 +2291,8 @@ def marketing_campaign_route():
                 "prompts_used": prompts_used,
                 "jobs": [],
                 "plan_only": True,
+                "stage5": stage5_pending,
+                "stage6": stage6_pending_placeholder(),
             }
         )
 
@@ -1553,6 +2310,14 @@ def marketing_campaign_route():
     except ValueError as e:
         return _err(400, str(e))
 
+    stage6 = run_stage6_campaign_qa(
+        brief=brief,
+        prompts_used=prompts_used,
+        jobs=jobs,
+        gen_image=gen_image,
+        gen_carousel=gen_carousel,
+        gen_video=gen_video,
+    )
     return jsonify(
         {
             "brand_id": brand_id,
@@ -1566,6 +2331,14 @@ def marketing_campaign_route():
             "prompts_used": prompts_used,
             "jobs": jobs,
             "plan_only": False,
+            "stage5": stage5_asset_manifest(
+                gen_image=gen_image,
+                gen_carousel=gen_carousel,
+                gen_video=gen_video,
+                prompts_used=prompts_used,
+                status="completed",
+            ),
+            "stage6": stage6,
         }
     )
 
@@ -1615,6 +2388,15 @@ def marketing_campaign_execute_route():
         log.exception("marketing campaign execute")
         return _err(500, str(e))
 
+    brief_exec = body.get("brief") if isinstance(body.get("brief"), dict) else None
+    stage6_ex = run_stage6_campaign_qa(
+        brief=brief_exec,
+        prompts_used=prompts_used,
+        jobs=jobs,
+        gen_image=gen_image,
+        gen_carousel=gen_carousel,
+        gen_video=gen_video,
+    )
     return jsonify(
         {
             "brand_id": brand_id,
@@ -1624,6 +2406,14 @@ def marketing_campaign_execute_route():
             "generate_video": gen_video,
             "include_video": gen_video,
             "jobs": jobs,
+            "stage5": stage5_asset_manifest(
+                gen_image=gen_image,
+                gen_carousel=gen_carousel,
+                gen_video=gen_video,
+                prompts_used=prompts_used,
+                status="completed",
+            ),
+            "stage6": stage6_ex,
         }
     )
 
@@ -1677,7 +2467,9 @@ def _run_campaign_asset_jobs(
         image_prompt = str(prompts_used.get("image_prompt") or "").strip()
         if not image_prompt:
             raise ValueError("prompts_used missing image_prompt")
-        jobs.append(_run_asset_generation(brand_id, "image", image_prompt, 1, require_approval, img_opts))
+        image_n = int(prompts_used.get("image_n") or 1)
+        image_n = max(1, min(10, image_n))
+        jobs.append(_run_asset_generation(brand_id, "image", image_prompt, image_n, require_approval, img_opts))
 
     if gen_carousel:
         carousel_n_eff = int(prompts_used.get("carousel_n") or 4)
@@ -1694,6 +2486,7 @@ def _run_campaign_asset_jobs(
         if not isinstance(video_plan, dict):
             raise ValueError("prompts_used missing video plan")
         vid_opts: dict[str, Any] = dict(base_opts) if base_opts else {}
+        vid_opts = merge_stage5_video_options(prompts_used, vid_opts)
         vid_opts["video_total_seconds"] = int(video_plan["total_seconds"])
         vid_opts["video_clip_seconds"] = int(video_plan["clip_seconds"])
         vid_opts["video_aspect_ratio"] = video_aspect_ratio
@@ -1703,6 +2496,9 @@ def _run_campaign_asset_jobs(
         sb = video_plan.get("video_storyboard")
         if isinstance(sb, list):
             vid_opts["video_storyboard"] = sb
+        vov = video_plan.get("video_segment_overlays")
+        if isinstance(vov, list) and any(str(x).strip() for x in vov):
+            vid_opts["video_segment_overlays"] = [str(x) for x in vov]
         v_prompt = str(video_plan.get("video_prompt") or "").strip()
         if not v_prompt:
             raise ValueError("prompts_used missing video_prompt")
@@ -1794,6 +2590,9 @@ def creative_assets_route():
         sb = vp.get("video_storyboard")
         if isinstance(sb, list):
             vid_opts["video_storyboard"] = sb
+        vov = vp.get("video_segment_overlays")
+        if isinstance(vov, list) and any(str(x).strip() for x in vov):
+            vid_opts["video_segment_overlays"] = [str(x) for x in vov]
         v_prompt = str(vp.get("video_prompt") or "").strip()
         if not v_prompt:
             return _err(500, "missing video_prompt after planning")
