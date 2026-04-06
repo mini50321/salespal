@@ -7,3 +7,4 @@ google-cloud-aiplatform==1.87.0
 google-cloud-firestore==2.19.0
 google-cloud-storage==2.19.0
 pypdf==5.1.0
+pytest==8.3.5

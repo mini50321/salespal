@@ -40,6 +40,7 @@ from .lead_ingest import (
     verify_ingest_auth,
 )
 from .scheduler_auth import verify_scheduler_internal_request
+from .security import PublicRateLimiter, verify_admin_api_key
 from .social import get_provider
 from .whatsapp_cloud import (
     default_locale,
@@ -58,6 +59,9 @@ from .zoho import (
     zoho_first_row_outcome,
 )
 from . import public_chat as public_chat_api
+from . import marketing_leads_http
+from .marketing_copy import generate_marketing_copy
+from .lead_store import make_dedupe_key
 
 
 app = Flask(__name__)
@@ -67,6 +71,19 @@ gen = Generator()
 zoho = ZohoClient()
 
 log = logging.getLogger(__name__)
+rate_limiter = PublicRateLimiter()
+
+_ADMIN_GUARDED_PREFIXES = (
+    "/v1/integrations/zoho/",
+    "/v1/integrations/whatsapp/",
+)
+_ADMIN_GUARDED_EXACT = {
+    "/v1/marketing/posts/dispatch",
+}
+_PUBLIC_RATE_LIMITED = {
+    "/v1/marketing/leads",
+    "/v1/marketing/copy",
+}
 
 
 def _service_index_payload() -> dict[str, Any]:
@@ -87,6 +104,9 @@ def _service_index_payload() -> dict[str, Any]:
             "creative_assets": "/v1/marketing/creative-assets",
             "marketing_campaign": "/v1/marketing/campaign",
             "marketing_campaign_execute": "/v1/marketing/campaign/execute",
+            "marketing_copy": "/v1/marketing/copy",
+            "marketing_leads": "/v1/marketing/leads",
+            "marketing_lead_form_embed": "/v1/marketing/embed/lead-form",
         },
     }
 
@@ -177,6 +197,8 @@ def index():
 def _public_chat_cors(resp):
     for k, v in public_chat_api.cors_header_items(request).items():
         resp.headers[k] = v
+    for k, v in marketing_leads_http.lead_capture_cors_headers(request).items():
+        resp.headers[k] = v
     return resp
 
 
@@ -189,6 +211,7 @@ def _log_request():
         or "/cron/" in request.path
         or request.path.startswith("/v1/public/chat")
         or request.path.endswith("/dispatch")
+        or (request.path == "/v1/marketing/leads" and request.method == "OPTIONS")
     ):
         return None
     log.info(
@@ -202,6 +225,28 @@ def _log_request():
             }
         },
     )
+    return None
+
+
+@app.before_request
+def _enforce_security_guards():
+    path = request.path
+
+    # Optional admin API key guard for integration/admin operations.
+    if (
+        path in _ADMIN_GUARDED_EXACT or any(path.startswith(pfx) for pfx in _ADMIN_GUARDED_PREFIXES)
+    ) and not verify_admin_api_key(request):
+        return _err(401, "admin api key required")
+
+    # Basic per-IP throttling for public endpoints.
+    if request.method == "POST" and path in _PUBLIC_RATE_LIMITED:
+        ok, retry_after = rate_limiter.check(request)
+        if not ok:
+            resp, status = _err(429, "rate limit exceeded")
+            if retry_after is not None:
+                resp.headers["Retry-After"] = str(retry_after)
+            return resp, status
+
     return None
 
 
@@ -2017,6 +2062,33 @@ def fetch_website_hints_route():
         return _err(500, str(e))
 
 
+@app.post("/v1/marketing/copy")
+def marketing_copy_route():
+    """Generate short marketing text (captions, email, headlines, landing snippet) via Vertex or mock."""
+    body = request.get_json(force=True, silent=True) or {}
+    content_type = str(body.get("content_type") or "").strip()
+    context = body.get("context")
+    brief = body.get("brief") if isinstance(body.get("brief"), dict) else None
+    brand_name = str(body.get("brand_name") or "").strip() or None
+    tone = str(body.get("tone") or "").strip() or None
+    locale = str(body.get("locale") or "").strip() or None
+    try:
+        out = generate_marketing_copy(
+            content_type=content_type,
+            context=str(context).strip() if isinstance(context, str) else None,
+            brief=brief,
+            brand_name=brand_name,
+            tone=tone,
+            locale=locale,
+        )
+        return jsonify(out)
+    except ValueError as e:
+        return _err(400, str(e))
+    except Exception as e:
+        log.exception("marketing copy route")
+        return _err(500, str(e))
+
+
 @app.post("/v1/marketing/campaign")
 def marketing_campaign_route():
     """
@@ -2788,9 +2860,29 @@ def dispatch_posts():
     return jsonify({"processed": processed, "posted": posted, "failed": failed, "now": now_iso})
 
 
-@app.post("/v1/marketing/leads")
+@app.get("/v1/marketing/embed/lead-form")
+def embed_lead_form():
+    """Hosted HTML form for same-origin lead capture (Milestone 1 landing pages on the API host)."""
+    brand_id = str(request.args.get("brand_id") or "").strip()
+    if not brand_id or len(brand_id) > 64:
+        return _err(400, "brand_id query parameter required")
+    source = str(request.args.get("source") or "embed_form").strip()
+    if len(source) > 64:
+        return _err(400, "invalid source")
+    page = marketing_leads_http.lead_form_embed_page(brand_id=brand_id, source=source)
+    return Response(page, mimetype="text/html; charset=utf-8")
+
+
+@app.route("/v1/marketing/leads", methods=["POST", "OPTIONS"])
 def capture_lead():
-    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    if request.method == "OPTIONS":
+        return marketing_leads_http.lead_capture_options_response(request)
+
+    parsed, parse_err = marketing_leads_http.parse_lead_request_body(request)
+    if parse_err or parsed is None:
+        return _err(415, parse_err or "invalid body")
+    body = parsed
+
     brand_id = str(body.get("brand_id") or "").strip()
     source = str(body.get("source") or "web").strip()
     name = body.get("name")
@@ -2810,14 +2902,27 @@ def capture_lead():
     if not isinstance(raw, dict):
         raw = {"value": raw}
 
-    idem = sanitize_idempotency_key(request.headers.get("Idempotency-Key"))
+    hdr_idem = request.headers.get("Idempotency-Key")
+    body_idem = body.get("idempotency_key")
+    idem_src = (hdr_idem or "").strip() or (
+        str(body_idem).strip() if body_idem is not None and str(body_idem).strip() else None
+    )
+    idem = sanitize_idempotency_key(idem_src)
+
+    em = str(email) if email is not None else None
+    ph = str(phone) if phone is not None else None
+    if not make_dedupe_key(brand_id, em, ph) and not idem:
+        return _err(
+            400,
+            "valid email or phone required (or send Idempotency-Key / idempotency_key for tracked submissions)",
+        )
 
     lead, created = leads.upsert(
         brand_id=brand_id,
         source=source,
         name=str(name) if name is not None else None,
-        email=str(email) if email is not None else None,
-        phone=str(phone) if phone is not None else None,
+        email=em,
+        phone=ph,
         company=str(company) if company is not None else None,
         message=str(message) if message is not None else None,
         utm=utm,
@@ -2826,6 +2931,11 @@ def capture_lead():
     )
 
     _auto_sync_lead(lead)
+
+    ct = (request.content_type or "").split(";")[0].strip().lower()
+    redir = marketing_leads_http.safe_form_redirect_url(str(body.get("redirect_url") or body.get("redirect") or ""))
+    if redir and ct in ("application/x-www-form-urlencoded", "multipart/form-data"):
+        return redirect(redir, code=303)
 
     return jsonify({"created": created, "lead": lead.__dict__})
 
@@ -2855,16 +2965,27 @@ def lead_webhook():
     if not isinstance(raw, dict):
         raw = {"payload": raw}
 
-    idem = sanitize_idempotency_key(
-        request.headers.get("Idempotency-Key") or (raw.get("idempotency_key") if isinstance(raw, dict) else None)
+    hdr_idem = request.headers.get("Idempotency-Key")
+    raw_idem = raw.get("idempotency_key") if isinstance(raw, dict) else None
+    idem_src = (hdr_idem or "").strip() or (
+        str(raw_idem).strip() if raw_idem is not None and str(raw_idem).strip() else None
     )
+    idem = sanitize_idempotency_key(idem_src)
+
+    em = str(email) if email is not None else None
+    ph = str(phone) if phone is not None else None
+    if not make_dedupe_key(brand_id, em, ph) and not idem:
+        return _err(
+            400,
+            "valid email or phone required (or send Idempotency-Key / idempotency_key in payload)",
+        )
 
     lead, created = leads.upsert(
         brand_id=brand_id,
         source=source,
         name=str(name) if name is not None else None,
-        email=str(email) if email is not None else None,
-        phone=str(phone) if phone is not None else None,
+        email=em,
+        phone=ph,
         company=str(company) if company is not None else None,
         message=str(message) if message is not None else None,
         utm=utm,
