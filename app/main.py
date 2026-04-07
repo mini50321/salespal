@@ -535,6 +535,15 @@ def demo_ui():
         .layout { grid-template-columns: 1fr; }
         .panel-out { position: static !important; }
       }
+      @media (max-height: 520px) and (orientation: landscape) {
+        .container { padding: 0.85rem 0.9rem 1.2rem; }
+        .topbar { padding: 0 1rem; }
+        .card { padding: 0.9rem 1rem; }
+        .row2 { grid-template-columns: 1fr; }
+        pre#out { max-height: 40vh; }
+        .asset-preview-body img,
+        .asset-preview-body video { max-height: 40vh; }
+      }
       .card {
         background: var(--surface);
         border-radius: var(--radius);
@@ -1144,6 +1153,17 @@ def demo_ui():
             <input id="studio_logo_image" type="file" accept="image/png,image/jpeg,image/jpg,image/webp,.png,.jpg,.jpeg,.webp" />
             <label for="studio_primary_market">Market</label>
             <input id="studio_primary_market" type="text" value="India" placeholder="Country / region" autocomplete="off" />
+            <label for="studio_video_language">Video language</label>
+            <select id="studio_video_language">
+              <option value="auto" selected>Auto (brief-driven)</option>
+              <option value="en">English</option>
+              <option value="hi">Hindi</option>
+              <option value="hinglish">Hinglish</option>
+              <option value="es">Spanish</option>
+              <option value="fr">French</option>
+              <option value="de">German</option>
+              <option value="ar">Arabic</option>
+            </select>
             <label for="studio_objective">Objective</label>
             <input id="studio_objective" type="text" placeholder="e.g. Leads, awareness, installs" autocomplete="off" />
             <label for="studio_on_screen_lines">Exact lines on video (optional)</label>
@@ -1203,6 +1223,9 @@ def demo_ui():
                   <option value="0.5">0.5 min (30s)</option>
                   <option value="1" selected>1 min (60s)</option>
                   <option value="2">2 min (120s)</option>
+                  <option value="3">3 min (180s)</option>
+                  <option value="5">5 min (300s)</option>
+                  <option value="10">10 min (600s)</option>
                 </select>
               </div>
             </div>
@@ -1766,6 +1789,8 @@ def demo_ui():
           if (ob && (ob.value || '').trim()) body.objective = (ob.value || '').trim();
           var pmEl = document.getElementById('studio_primary_market');
           if (pmEl && (pmEl.value || '').trim()) body.primary_market = (pmEl.value || '').trim();
+          var vl = document.getElementById('studio_video_language');
+          if (vl && (vl.value || '').trim()) body.video_language = (vl.value || '').trim();
           var osl = document.getElementById('studio_on_screen_lines');
           var lpp = document.getElementById('studio_logo_persistent');
           if (osl && (osl.value || '').trim()) body.on_screen_lines = (osl.value || '').trim();
@@ -2124,6 +2149,9 @@ def marketing_campaign_route():
     objective = str(body.get("objective") or "").strip() or None
     copy_locked_lines = _parse_campaign_on_screen_lines(body.get("on_screen_lines"))
     primary_market = _normalize_primary_market(body.get("primary_market"))
+    video_language = str(body.get("video_language") or "auto").strip().lower() or "auto"
+    if len(video_language) > 24:
+        return _err(400, "video_language too long")
     logo_persistent = True if body.get("logo_persistent") is None else bool(body.get("logo_persistent"))
     video_aspect_ratio = str(body.get("video_aspect_ratio") or "16:9").strip()
     if video_aspect_ratio not in ("9:16", "16:9", "1:1"):
@@ -2180,6 +2208,7 @@ def marketing_campaign_route():
             "on_screen_lines_verbatim": copy_locked_lines,
             "logo_image_supplied": bool(logo_bytes),
             "primary_market": primary_market,
+            "video_language": video_language,
         }
         lv = str(logo_ctx.get("logo_visual_description") or "").strip()
         if lv:
@@ -2220,6 +2249,7 @@ def marketing_campaign_route():
     arq["logo_persistent"] = bool(logo_persistent)
     arq["logo_image_supplied"] = bool(logo_bytes)
     arq["primary_market"] = primary_market
+    arq["video_language"] = video_language
     if _primary_market_is_india(primary_market):
         cd_brief = str(arq.get("casting_direction") or "").strip()
         arq["casting_direction"] = (
@@ -2307,6 +2337,15 @@ def marketing_campaign_route():
                 prompts_imagen = derive_imagen_prompts_from_brief(brief, carousel_n=carousel_n)
             if need_video_plan:
                 video_plan = derive_video_plan_from_brief(brief, total_seconds=v_total, clip_seconds=v_clip)
+                if isinstance(video_plan, dict) and video_language != "auto":
+                    lang_note = (
+                        f"Language requirement: all spoken voiceover and on-screen text should be in {video_language}. "
+                        "Keep wording natural for native speakers and do not mix unrelated languages."
+                    )
+                    vp = str(video_plan.get("video_prompt") or "").strip()
+                    vc = str(video_plan.get("video_continuity_text") or "").strip()
+                    video_plan["video_prompt"] = (f"{vp}\n\n{lang_note}" if vp else lang_note).strip()
+                    video_plan["video_continuity_text"] = (f"{vc}\n\n{lang_note}" if vc else lang_note).strip()
             apply_production_plan_to_prompts(
                 production_plan,
                 prompts_imagen=prompts_imagen if need_imagen else None,
