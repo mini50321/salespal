@@ -144,4 +144,4 @@ def send_template(
 
 
 def default_locale() -> str:
-    return (os.getenv("WHATSAPP_DEFAULT_LOCALE") or "en").strip().lower()[:8] or "en"
+    return (os.getenv("WHATSAPP_DEFAULT_LOCALE") or "hing").strip().lower()[:8] or "hing"

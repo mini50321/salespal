@@ -51,6 +51,14 @@ from .whatsapp_cloud import (
     verify_subscription as whatsapp_verify_subscription,
 )
 from .whatsapp_outreach import batch_whatsapp_outreach, outreach_one_lead
+from .voice_outreach import batch_voice_outreach, outreach_one_lead as voice_outreach_one_lead
+from .parallel_outreach import start_parallel_outreach
+from .whatsapp_nurture import process_due_nurtures
+from .cold_campaign_engine import enroll_cold_lead, process_due_cold_campaigns
+from .sales_pipeline import merge_classification
+from .voice_stt import transcribe_audio_base64, transcribe_audio_url
+from .voice_tata import parse_event as parse_voice_tata_event, verify_webhook as verify_voice_tata_webhook
+from .voice_tts import synthesize as voice_synthesize
 from .conversation_store import Conversation
 from .zoho import (
     ZohoClient,
@@ -76,6 +84,8 @@ rate_limiter = PublicRateLimiter()
 _ADMIN_GUARDED_PREFIXES = (
     "/v1/integrations/zoho/",
     "/v1/integrations/whatsapp/",
+    "/v1/integrations/voice/",
+    "/v1/integrations/sales/",
 )
 _ADMIN_GUARDED_EXACT = {
     "/v1/marketing/posts/dispatch",
@@ -97,6 +107,7 @@ def _service_index_payload() -> dict[str, Any]:
             "healthz": "/healthz",
             "readyz": "/readyz",
             "whatsapp_webhook": "/v1/webhooks/whatsapp",
+            "voice_tata_webhook": "/v1/webhooks/voice/tata",
             "public_chat_start": "/v1/public/chat/start",
             "public_chat_message": "/v1/public/chat/message",
             "creative_brief": "/v1/marketing/creative-brief",
@@ -107,6 +118,14 @@ def _service_index_payload() -> dict[str, Any]:
             "marketing_copy": "/v1/marketing/copy",
             "marketing_leads": "/v1/marketing/leads",
             "marketing_lead_form_embed": "/v1/marketing/embed/lead-form",
+            "voice_outreach_lead": "/v1/integrations/voice/outreach_lead/<lead_id>",
+            "voice_outreach_leads": "/v1/integrations/voice/outreach_leads",
+            "voice_outreach_cron": "/v1/cron/voice_outreach",
+            "parallel_outreach": "/v1/integrations/sales/parallel_outreach/<lead_id>",
+            "sales_classify": "/v1/integrations/sales/leads/<lead_id>/classify",
+            "cold_enroll": "/v1/integrations/sales/leads/<lead_id>/cold_enroll",
+            "cron_whatsapp_nurture": "/v1/cron/whatsapp_nurture",
+            "cron_cold_campaign": "/v1/cron/cold_campaign",
         },
     }
 
@@ -3231,6 +3250,111 @@ def whatsapp_webhook():
     return jsonify({"received": True, "processed": len(items), "errors": errs})
 
 
+def _voice_default_brand_id() -> str:
+    return (os.getenv("VOICE_DEFAULT_BRAND_ID") or "").strip()
+
+
+def _handle_tata_voice_event(payload: dict[str, Any]) -> dict[str, Any]:
+    ev = parse_voice_tata_event(payload)
+    brand_id = (ev.get("brand_id") or _voice_default_brand_id() or "").strip()
+    from_phone = str(ev.get("from_phone") or "").strip()
+    event_id = str(ev.get("event_id") or "").strip()
+    if not brand_id:
+        raise RuntimeError("set VOICE_DEFAULT_BRAND_ID or include brand_id in Tata webhook payload")
+    if not from_phone:
+        raise RuntimeError("missing caller phone in Tata webhook payload")
+
+    lead = leads.find_by_brand_and_phone(brand_id, from_phone)
+    if not lead:
+        lead, _ = leads.upsert(
+            brand_id=brand_id,
+            source="voice",
+            name=None,
+            email=None,
+            phone=from_phone,
+            company=None,
+            message=None,
+            utm=None,
+            raw={"voice_from": from_phone, "last_voice_event_id": event_id},
+            idempotency_key=None,
+        )
+    lead = leads.get(lead.id)
+    if not lead:
+        return {"processed": False, "reason": "lead_not_found"}
+
+    raw = lead.raw if isinstance(lead.raw, dict) else {}
+    if event_id and str(raw.get("last_processed_voice_event_id") or "") == event_id:
+        return {"processed": False, "reason": "duplicate_event", "lead_id": lead.id}
+
+    text = str(ev.get("transcript") or "").strip()
+    stt_meta: dict[str, Any] = {}
+    if not text:
+        audio_b64 = ev.get("audio_base64")
+        audio_mime = ev.get("audio_mime_type")
+        audio_url = ev.get("audio_url")
+        if isinstance(audio_b64, str) and audio_b64.strip():
+            text, stt_meta = transcribe_audio_base64(audio_b64, audio_mime if isinstance(audio_mime, str) else None)
+        elif isinstance(audio_url, str) and audio_url.strip():
+            text, stt_meta = transcribe_audio_url(audio_url)
+    if not text:
+        return {"processed": False, "reason": "no_transcript", "lead_id": lead.id}
+
+    leads.merge_raw(
+        lead.id,
+        {
+            "voice_from": from_phone,
+            "last_voice_event_id": event_id,
+            "last_voice_text_preview": text[:240],
+            "last_voice_stt_meta": stt_meta,
+        },
+    )
+    lead = leads.get(lead.id)
+    if not lead:
+        return {"processed": False, "reason": "lead_missing_after_patch"}
+
+    _auto_sync_lead(lead)
+    conv = conversations.get_latest_for_lead(brand_id, lead.id)
+    if conv is None or conv.state == "complete":
+        conv = conversations.create(
+            lead_id=lead.id,
+            brand_id=brand_id,
+            channel="voice",
+            locale=str(ev.get("locale") or "").strip() or None,
+            metadata={"voice_from": from_phone, "voice_call_id": ev.get("call_id")},
+        )
+    conv_out, reply = process_user_message(conv, text)
+    conversations.update(conv_out)
+    _sync_qualification_to_zoho(lead.id, conv_out)
+    tts = voice_synthesize(reply)
+    if event_id:
+        leads.merge_raw(lead.id, {"last_processed_voice_event_id": event_id, "last_voice_tts": tts})
+    return {
+        "processed": True,
+        "lead_id": lead.id,
+        "conversation_id": conv_out.id,
+        "state": conv_out.state,
+        "assistant_reply": reply,
+        "tts": tts,
+    }
+
+
+@app.post("/v1/webhooks/voice/tata")
+def voice_tata_webhook():
+    if not verify_voice_tata_webhook(request):
+        return _err(401, "invalid signature")
+    payload = request.get_json(force=True, silent=True) or {}
+    if not isinstance(payload, dict):
+        return _err(400, "invalid payload")
+    try:
+        out = _handle_tata_voice_event(payload)
+    except ValueError as e:
+        return _err(400, str(e))
+    except Exception as e:
+        log.exception("voice tata webhook")
+        return _err(500, str(e))
+    return jsonify(out)
+
+
 @app.get("/v1/marketing/leads/<lead_id>")
 def get_lead(lead_id: str):
     l = leads.get(lead_id)
@@ -3298,6 +3422,43 @@ def _whatsapp_send_configured() -> bool:
     )
 
 
+@app.post("/v1/integrations/voice/outreach_lead/<lead_id>")
+def integrations_voice_outreach_lead(lead_id: str):
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    ignore = bool(body.get("ignore_outreach_marker"))
+    out = voice_outreach_one_lead(
+        leads,
+        conversations,
+        lead_id,
+        auto_sync_lead=_auto_sync_lead,
+        ignore_outreach_marker=ignore,
+    )
+    if out.get("status") == "failed":
+        return jsonify(out), 502
+    return jsonify(out)
+
+
+@app.post("/v1/integrations/voice/outreach_leads")
+def integrations_voice_outreach_leads():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    brand_id = str(body.get("brand_id") or "").strip() or None
+    limit = int(body.get("limit") or 25)
+    ignore = bool(body.get("ignore_outreach_marker"))
+    if limit < 1 or limit > 200:
+        return _err(400, "invalid limit")
+    batch = batch_voice_outreach(
+        leads,
+        conversations,
+        brand_id=brand_id,
+        limit=limit,
+        auto_sync_lead=_auto_sync_lead,
+        ignore_outreach_marker=ignore,
+    )
+    if batch.get("error"):
+        return _err(400, str(batch["error"]))
+    return jsonify(batch)
+
+
 @app.post("/v1/integrations/whatsapp/outreach_lead/<lead_id>")
 def integrations_whatsapp_outreach_lead(lead_id: str):
     if not _whatsapp_send_configured():
@@ -3362,3 +3523,115 @@ def cron_whatsapp_outreach():
     if batch.get("error"):
         return _err(400, str(batch["error"]))
     return jsonify(batch)
+
+
+@app.post("/v1/cron/voice_outreach")
+def cron_voice_outreach():
+    if not verify_scheduler_internal_request(request):
+        return _err(401, "unauthorized")
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    brand_id = str(body.get("brand_id") or "").strip() or None
+    limit = int(body.get("limit") or os.getenv("VOICE_OUTREACH_CRON_LIMIT") or 25)
+    ignore = bool(body.get("ignore_outreach_marker"))
+    if limit < 1 or limit > 200:
+        return _err(400, "invalid limit")
+    batch = batch_voice_outreach(
+        leads,
+        conversations,
+        brand_id=brand_id,
+        limit=limit,
+        auto_sync_lead=_auto_sync_lead,
+        ignore_outreach_marker=ignore,
+        retry_only=True,
+    )
+    if batch.get("error"):
+        return _err(400, str(batch["error"]))
+    return jsonify(batch)
+
+
+@app.post("/v1/integrations/sales/parallel_outreach/<lead_id>")
+def integrations_sales_parallel_outreach(lead_id: str):
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    tz = body.get("timezone") or body.get("tz")
+    out = start_parallel_outreach(
+        leads,
+        conversations,
+        lead_id,
+        tz_name=str(tz).strip() if tz else None,
+        auto_sync_lead=_auto_sync_lead,
+    )
+    if out.get("status") == "error":
+        code = 404 if out.get("reason") == "not_found" else 400
+        return jsonify(out), code
+    return jsonify(out)
+
+
+@app.post("/v1/integrations/sales/leads/<lead_id>/classify")
+def integrations_sales_classify(lead_id: str):
+    lead = leads.get(lead_id)
+    if not lead:
+        return _err(404, "not found")
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    before = dict(lead.raw or {})
+    after = merge_classification(
+        before,
+        user_type=body.get("user_type"),
+        lead_temperature=body.get("lead_temperature"),
+        escalation=body.get("escalation"),
+        feedback_score=body.get("feedback_score"),
+    )
+    patch = {k: after[k] for k in after if after.get(k) != before.get(k)}
+    if patch:
+        leads.merge_raw(lead_id, patch)
+    keys = ("sales_user_type", "sales_lead_temperature", "sales_escalation", "sales_feedback_score")
+    return jsonify({"lead_id": lead_id, "sales": {k: after.get(k) for k in keys if k in after}})
+
+
+@app.post("/v1/integrations/sales/leads/<lead_id>/cold_enroll")
+def integrations_sales_cold_enroll(lead_id: str):
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    tz = body.get("timezone") or body.get("tz")
+    out = enroll_cold_lead(leads, lead_id, str(tz).strip() if tz else None)
+    if out.get("status") == "error":
+        return jsonify(out), 404
+    return jsonify(out)
+
+
+@app.post("/v1/cron/whatsapp_nurture")
+def cron_whatsapp_nurture():
+    if not verify_scheduler_internal_request(request):
+        return _err(401, "unauthorized")
+    if not _whatsapp_send_configured():
+        return _err(409, "whatsapp send not configured")
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    brand_id = str(body.get("brand_id") or "").strip() or None
+    limit = int(body.get("limit") or os.getenv("WHATSAPP_NURTURE_CRON_LIMIT") or 25)
+    if limit < 1 or limit > 200:
+        return _err(400, "invalid limit")
+    return jsonify(
+        process_due_nurtures(
+            leads,
+            brand_id=brand_id,
+            limit=limit,
+            auto_sync_lead=_auto_sync_lead,
+        )
+    )
+
+
+@app.post("/v1/cron/cold_campaign")
+def cron_cold_campaign():
+    if not verify_scheduler_internal_request(request):
+        return _err(401, "unauthorized")
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    brand_id = str(body.get("brand_id") or "").strip() or None
+    limit = int(body.get("limit") or os.getenv("COLD_CAMPAIGN_CRON_LIMIT") or 25)
+    if limit < 1 or limit > 200:
+        return _err(400, "invalid limit")
+    return jsonify(
+        process_due_cold_campaigns(
+            leads,
+            brand_id=brand_id,
+            limit=limit,
+            auto_sync_lead=_auto_sync_lead,
+        )
+    )

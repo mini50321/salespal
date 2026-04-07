@@ -8,6 +8,15 @@ from .settings import settings
 
 
 MESSAGES: dict[str, dict[str, str]] = {
+    "hing": {
+        "welcome": "Namaste! Team aapki help ke liye kuch short sawal pooch rahi hai.",
+        "ask_budget": "Aap roughly kaunsa budget soch rahe ho is project ke liye?",
+        "ask_location": "Aap kaunse city / region se ho?",
+        "ask_timeline": "Aap kitne time mein decision lena chahte ho?",
+        "done": "Dhanyavaad! Team jaldi next steps ke saath connect karegi.",
+        "already_done": "Ye details pehle hi save ho chuki hain. Zarurat ho to team call karegi.",
+        "budget_clarify": "Please budget ek amount ya range mein likho — jaise 5 lakh ya 50000 INR.",
+    },
     "en": {
         "welcome": "Hello. I will ask a few short questions to help our team assist you.",
         "ask_budget": "What budget range are you considering for this?",
@@ -41,8 +50,24 @@ def _is_greeting(msg: str) -> bool:
 
 
 def _t(locale: str, key: str) -> str:
-    pack = MESSAGES.get(locale) or MESSAGES["en"]
+    pack = MESSAGES.get(locale) or MESSAGES["hing"] or MESSAGES["en"]
     return pack.get(key) or MESSAGES["en"][key]
+
+
+def suggest_locale_from_message(msg: str, *, default: str = "hing") -> str:
+    """
+    Light heuristic: Devanagari-heavy → hi, Latin-heavy → en, else Hinglish default.
+    """
+    s = (msg or "").strip()
+    if not s:
+        return default if default in MESSAGES else "hing"
+    dev = sum(1 for c in s if "\u0900" <= c <= "\u097f")
+    lat = sum(1 for c in s if ("a" <= c.lower() <= "z"))
+    if dev >= 3 and dev >= lat:
+        return "hi"
+    if lat >= 10 and lat > dev * 2:
+        return "en"
+    return "hing" if "hing" in MESSAGES else default
 
 
 def _polish_reply(
@@ -73,7 +98,7 @@ def _polish_reply(
 
 
 def opening_turn(locale: str, channel: str) -> dict[str, Any]:
-    lc = locale if locale in MESSAGES else "en"
+    lc = locale if locale in MESSAGES else ("hing" if "hing" in MESSAGES else "en")
     text = f"{_t(lc, 'welcome')} {_t(lc, 'ask_budget')}"
     text = _polish_reply(
         locale=lc,
@@ -90,7 +115,11 @@ def opening_turn(locale: str, channel: str) -> dict[str, Any]:
 
 def process_user_message(conv: Conversation, text: str) -> tuple[Conversation, str]:
     msg = (text or "").strip()
-    lc = conv.locale if conv.locale in MESSAGES else "en"
+    if conv.locale in ("hing", "en", "hi") and msg and conv.state != "complete":
+        sl = suggest_locale_from_message(msg, default=conv.locale if conv.locale in MESSAGES else "hing")
+        if sl in MESSAGES and sl != conv.locale:
+            conv.locale = sl
+    lc = conv.locale if conv.locale in MESSAGES else "hing"
 
     if not msg:
         reply = _t(conv.locale, "ask_budget") if conv.state != "complete" else _t(conv.locale, "already_done")

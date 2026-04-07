@@ -4,7 +4,9 @@ from typing import Any
 
 from .social_linkedin import LinkedInProvider
 from .social_meta import MetaFacebookProvider, MetaInstagramProvider
+from .social_twitter import TwitterXProvider
 from .social_types import PostResult, SocialProvider
+from .social_youtube import YouTubeProvider
 
 
 class MockProvider(SocialProvider):
@@ -33,4 +35,8 @@ def get_provider(provider_name: str) -> SocialProvider:
         return MetaInstagramProvider()
     if n == "linkedin":
         return LinkedInProvider()
+    if n in ("twitter", "twitter_x", "x"):
+        return TwitterXProvider()
+    if n in ("youtube", "youtube_shorts"):
+        return YouTubeProvider()
     raise ValueError("unsupported provider")

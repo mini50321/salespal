@@ -12,3 +12,5 @@ terraform.rc
 *.auto.tfvars
 terraform.tfvars
 service-account*.json
+.env
+.env.*
