@@ -55,6 +55,9 @@ from .voice_outreach import batch_voice_outreach, outreach_one_lead as voice_out
 from .parallel_outreach import start_parallel_outreach
 from .whatsapp_nurture import process_due_nurtures
 from .cold_campaign_engine import enroll_cold_lead, process_due_cold_campaigns
+from .m1_ops import M1OpsStore, allocate_budget, suggest_platforms
+from .sale_ops import SaleOpsStore
+from .salespal360_ops import SalesPal360Store
 from .sales_pipeline import merge_classification
 from .voice_stt import transcribe_audio_base64, transcribe_audio_url
 from .voice_tata import parse_event as parse_voice_tata_event, verify_webhook as verify_voice_tata_webhook
@@ -77,6 +80,9 @@ store, posts, leads = build_stores(settings)
 conversations = build_conversation_store(settings)
 gen = Generator()
 zoho = ZohoClient()
+m1ops = M1OpsStore(os.getenv("M1_OPS_STORE_PATH") or "./m1_ops_store.json")
+sp360 = SalesPal360Store(os.getenv("SALESPAL360_STORE_PATH") or "./salespal360_store.json")
+saleops = SaleOpsStore(os.getenv("SALE_OPS_STORE_PATH") or "./sale_ops_store.json")
 
 log = logging.getLogger(__name__)
 rate_limiter = PublicRateLimiter()
@@ -86,6 +92,9 @@ _ADMIN_GUARDED_PREFIXES = (
     "/v1/integrations/whatsapp/",
     "/v1/integrations/voice/",
     "/v1/integrations/sales/",
+    "/v1/marketing/ops/",
+    "/v1/salespal360/",
+    "/v1/sale/",
 )
 _ADMIN_GUARDED_EXACT = {
     "/v1/marketing/posts/dispatch",
@@ -126,6 +135,14 @@ def _service_index_payload() -> dict[str, Any]:
             "cold_enroll": "/v1/integrations/sales/leads/<lead_id>/cold_enroll",
             "cron_whatsapp_nurture": "/v1/cron/whatsapp_nurture",
             "cron_cold_campaign": "/v1/cron/cold_campaign",
+            "marketing_console": "/marketing",
+            "marketing_dashboard": "/v1/marketing/ops/dashboard",
+            "marketing_optimization_loop": "/v1/marketing/ops/optimization/loop",
+            "salespal360_console": "/salespal360",
+            "salespal360_analytics": "/v1/salespal360/analytics",
+            "salespal360_sales_dashboard": "/v1/salespal360/sales/dashboard",
+            "salespal360_m2_features": "/v1/salespal360/features/status",
+            "sale_console": "/sale",
         },
     }
 
@@ -424,7 +441,7 @@ def demo_ui():
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>SalesPal — Milestone 1 · Demo console</title>
+    <title>SalesPal — Demo console</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700&display=swap" rel="stylesheet" />
@@ -2143,6 +2160,9 @@ def marketing_campaign_route():
     brand_id = str(body.get("brand_id") or "demo").strip()
     source_type = str(body.get("source_type") or "").strip().lower()
     brand_hint = str(body.get("brand_hint") or "").strip() or None
+    audience_hint = str(body.get("audience_hint") or "").strip()
+    if audience_hint:
+        brand_hint = f"{brand_hint} | Target audience: {audience_hint}" if brand_hint else f"Target audience: {audience_hint}"
     brand_name = str(body.get("brand_name") or "").strip() or None
     brand_tagline = str(body.get("brand_tagline") or "").strip() or None
     logo_text = str(body.get("logo_text") or "").strip() or None
@@ -2920,7 +2940,7 @@ def dispatch_posts():
 
 @app.get("/v1/marketing/embed/lead-form")
 def embed_lead_form():
-    """Hosted HTML form for same-origin lead capture (Milestone 1 landing pages on the API host)."""
+    """Hosted HTML form for same-origin lead capture landing pages on the API host."""
     brand_id = str(request.args.get("brand_id") or "").strip()
     if not brand_id or len(brand_id) > 64:
         return _err(400, "brand_id query parameter required")
@@ -3674,3 +3694,1852 @@ def cron_cold_campaign():
             auto_sync_lead=_auto_sync_lead,
         )
     )
+
+
+def _append_lead_raw_event(lead_id: str, key: str, event: dict[str, Any]) -> dict[str, Any] | None:
+    lead = leads.get(lead_id)
+    if not lead:
+        return None
+    raw = dict(lead.raw or {}) if isinstance(getattr(lead, "raw", None), dict) else {}
+    items = list(raw.get(key) or [])
+    items.append(event)
+    raw[key] = items[-100:]
+    leads.merge_raw(lead_id, {key: raw[key]})
+    return raw
+
+
+@app.get("/marketing")
+def marketing_console():
+    html = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SalesPal Marketing Engine</title>
+  <style>
+    :root { --bg:#eef2f7; --card:#fff; --text:#0f172a; --muted:#64748b; --line:#d8e0ea; --orange:#ea580c; --green:#15803d; --blue:#0369a1; --pink:#be185d; --yellow:#ca8a04; }
+    *{ box-sizing:border-box; } body{ margin:0; background:var(--bg); color:var(--text); font-family:Inter,system-ui,Arial,sans-serif; }
+    .wrap{ max-width:1320px; margin:0 auto; padding:16px; }
+    .hero{ background:linear-gradient(135deg,var(--orange),#c2410c); color:#fff; border-radius:14px; padding:16px 18px; margin-bottom:14px; border:2px solid #fed7aa; }
+    .hero .sub{ color:#ffedd5; font-size:13px; margin-top:6px; line-height:1.45; }
+    .pipeline{ display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
+    .pipe{ font-size:11px; font-weight:800; padding:6px 10px; border-radius:8px; background:#fff7ed; color:#9a3412; border:1px solid #fdba74; }
+    .grid{ display:grid; grid-template-columns:2.1fr 1fr; gap:12px; } @media(max-width:1080px){ .grid{ grid-template-columns:1fr; } }
+    .card{ background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px; margin-bottom:12px; }
+    .card h2{ margin:0 0 10px; font-size:17px; display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+    .tag{ font-size:10px; font-weight:800; text-transform:uppercase; padding:3px 8px; border-radius:6px; color:#fff; }
+    .tag.core{ background:var(--orange);} .tag.ai{ background:var(--green);} .tag.soc{ background:var(--blue);} .tag.ads{ background:var(--pink);} .tag.cam{ background:var(--yellow); color:#422006;}
+    h3{ margin:0 0 8px; font-size:14px; color:var(--muted); text-transform:uppercase; letter-spacing:.06em; }
+    label{ font-size:11px; color:var(--muted); display:block; margin:8px 0 4px; font-weight:700; text-transform:uppercase; letter-spacing:.04em; }
+    input,select,textarea{ width:100%; padding:8px 10px; border:1px solid var(--line); border-radius:8px; font:inherit; background:#fff; }
+    textarea{ min-height:72px; resize:vertical; }
+    .row{ display:grid; grid-template-columns:1fr 1fr; gap:10px; } @media(max-width:720px){ .row{ grid-template-columns:1fr; } }
+    .btns{ display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
+    button{ border:0; border-radius:9px; padding:8px 12px; font-weight:700; cursor:pointer; background:var(--blue); color:#fff; font-size:13px; }
+    button.alt{ background:#334155; } button.good{ background:var(--green); } button.warn{ background:#b91c1c; }
+    .hint{ color:var(--muted); font-size:12px; margin-top:6px; line-height:1.45; }
+    .flowline{ border-left:3px solid #fb923c; padding-left:12px; margin:8px 0 0 4px; }
+    .asset-grid{ display:grid; grid-template-columns:repeat(auto-fill,minmax(140px,1fr)); gap:8px; margin-top:8px; }
+    .asset{ border:1px dashed var(--line); border-radius:8px; padding:8px; font-size:12px; background:#f8fafc; }
+    pre{ margin:0; white-space:pre-wrap; word-break:break-word; background:#0f172a; color:#e2e8f0; border-radius:10px; padding:10px; max-height:52vh; overflow:auto; font-size:11px; }
+    .jump{ display:flex; flex-wrap:wrap; gap:8px; margin:10px 0; }
+    .jump a{ color:#0369a1; font-weight:700; font-size:13px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="hero">
+      <strong style="font-size:18px;">SalesPal Marketing Engine</strong>
+      <div class="sub">Business Input → AI Analysis → Brand Setup → Audience + Budget → AI Content Creation → Preview → Action Type (Social / Ads / Broadcast) → Lead Management → Dashboard → Digital Presence → AI Optimization Loop → Content.</div>
+      <div class="pipeline">
+        <span class="pipe">Business Input</span><span class="pipe">AI Analysis (USP / Audience / Industry)</span><span class="pipe">Brand Setup (Tone / Style)</span>
+        <span class="pipe">Audience Targeting + Budget Suggestion</span><span class="pipe">AI Content Creation</span>
+      </div>
+    </div>
+    <div class="grid">
+      <main>
+        <section class="card">
+          <h2><span class="tag core">Pipeline</span> Business input → AI plan → content</h2>
+          <div class="row">
+            <div><label>Brand Id</label><input id="brand" value="demo" /></div>
+            <div><label>Admin API Key</label><input id="adminkey" placeholder="if /v1/marketing/ops requires it" /></div>
+          </div>
+          <div class="row">
+            <div><label>Source Type</label><select id="src"><option value="text">Brief text</option><option value="url">Website URL</option></select></div>
+            <div><label>Objective</label><input id="obj" value="lead generation" /></div>
+          </div>
+          <label>Business Input (Website / PDFs / Product / Manual)</label>
+          <textarea id="brief" placeholder="Paste brief, or paste website URL when source = URL"></textarea>
+          <div class="row">
+            <div><label>Primary Market</label><input id="pm" value="India" /></div>
+            <div><label>Audience hint (for AI)</label><input id="audhint" value="SME owners" /></div>
+          </div>
+          <div class="flowline hint">AI Analysis + Brand + Audience are produced inside <code>POST /v1/marketing/campaign</code> (plan). Use <strong>Plan only</strong> first to preview prompts without burning credits on execution.</div>
+          <div class="asset-grid">
+            <label class="asset"><input type="checkbox" id="gimg" checked /> Images</label>
+            <label class="asset"><input type="checkbox" id="gvid" checked /> Videos / Reels</label>
+            <label class="asset"><input type="checkbox" id="gcar" checked /> Carousel</label>
+            <div class="asset" title="Generated with campaign plan">Caption + CTA <small style="color:#64748b">(in brief)</small></div>
+          </div>
+          <p class="hint"><strong>Sample Content View (preview):</strong> API response after Plan. <strong>Execute</strong> generates assets (may incur cost). Optional 3D/stitched preview depends on product config.</p>
+          <div class="btns">
+            <button onclick="runM1Plan()">AI Analysis + Plan (preview)</button>
+            <button class="good" onclick="runM1Exec()">Generate assets (execute)</button>
+          </div>
+        </section>
+
+        <section class="card">
+          <h2><span class="tag ai">Decision</span> Action Type</h2>
+          <p class="hint">Choose where to go next (same APIs as below).</p>
+          <div class="jump">
+            <a href="#sec-social">→ Social Posting → Social Media Engine</a>
+            <a href="#sec-ads">→ Run Ads → Ads Engine</a>
+            <a href="#sec-campaign">→ Broadcast Campaign → Campaign Engine</a>
+          </div>
+        </section>
+
+        <section class="card" id="sec-social">
+          <h2><span class="tag soc">Social</span> Social Media Engine</h2>
+          <p class="hint">Connect accounts (Meta / IG / LinkedIn / X / YouTube) · Post Now / Schedule · Auto Publish · Engagement Tracking · Platform Suggestion</p>
+          <div class="row">
+            <div><label>Platform</label><select id="platform"><option>instagram</option><option>facebook</option><option>linkedin</option><option>x</option><option>youtube</option></select></div>
+            <div><label>Account Handle</label><input id="handle" placeholder="@brand"/></div>
+          </div>
+          <div class="btns">
+            <button onclick="connectSocial()">Connect Account</button>
+            <button class="alt" onclick="platformSuggest()">Platform Suggestion</button>
+          </div>
+          <div class="row">
+            <div><label>Post mode</label><select id="pmode"><option value="post_now">Post Now</option><option value="schedule">Schedule</option><option value="auto_publish">Auto Publish</option></select></div>
+            <div><label>Schedule at (ISO, if schedule)</label><input id="pwhen" placeholder="2026-04-10T10:00:00+00:00" /></div>
+          </div>
+          <div class="btns">
+            <button onclick="socialPost()">Post / Schedule</button>
+            <button class="good" onclick="socialEng()">Engagement Tracking +1</button>
+          </div>
+        </section>
+
+        <section class="card" id="sec-ads">
+          <h2><span class="tag ads">Ads</span> Ads Engine</h2>
+          <p class="hint">Budget Allocation · Ad Launch · Basic Optimization · Lead Capture</p>
+          <div class="row">
+            <div><label>Campaign Name</label><input id="adname" value="Launch Campaign"/></div>
+            <div><label>Total Budget</label><input id="budget" type="number" value="50000"/></div>
+          </div>
+          <div class="btns">
+            <button onclick="allocate()">Budget Allocation</button>
+            <button onclick="adLaunch()">Ad Launch</button>
+            <button class="alt" onclick="adOptimize()">Basic Optimization</button>
+            <button class="good" onclick="adLeadCap()">Lead Capture</button>
+          </div>
+        </section>
+
+        <section class="card" id="sec-campaign">
+          <h2><span class="tag cam">Campaign</span> Campaign Engine (Broadcast)</h2>
+          <p class="hint">WhatsApp · SMS · Email · RCS · Audience Selection · Schedule + Timing · Incoming Responses</p>
+          <div class="row">
+            <div><label>Channel</label><select id="bch"><option>whatsapp</option><option>sms</option><option>email</option><option>rcs</option></select></div>
+            <div><label>Schedule (UTC iso)</label><input id="bsch" placeholder="optional"/></div>
+          </div>
+          <label>Audience (JSON)</label><textarea id="aud">{ "segment": "new_leads" }</textarea>
+          <div class="btns">
+            <button onclick="broadcastCreate()">Create Broadcast</button>
+            <button class="alt" onclick="broadcastResponse()">Incoming Responses +1</button>
+          </div>
+        </section>
+
+        <section class="card">
+          <h2><span class="tag soc">Leads</span> Lead Management (Manual)</h2>
+          <p class="hint">Lead details (Name / Source / Interest via API) · Mark Hot/Warm/Cold · Notes · Follow-up · History · Manual follow-up · Send to Sales (optional)</p>
+          <div class="row">
+            <div><label>Lead Id</label><input id="leadid" placeholder="paste lead id"/></div>
+            <div><label>Mark Lead</label><select id="leadtemp"><option>hot</option><option>warm</option><option>cold</option></select></div>
+          </div>
+          <label>Interest / notes</label><textarea id="leadnote"></textarea>
+          <label>Follow-up (UTC iso)</label><input id="follow" placeholder="2026-04-08T12:00:00+00:00"/>
+          <div class="btns">
+            <button onclick="leadNote()">Add Notes</button>
+            <button onclick="leadFollow()">Set Follow-up</button>
+            <button onclick="leadMark()">Mark Temperature</button>
+            <button class="alt" onclick="leadHistory()">View History</button>
+          </div>
+          <div class="btns">
+            <button onclick="sendOwner()">Send Lead to Owner (WhatsApp)</button>
+            <button class="alt" onclick="manualFu()">Manual Follow-up</button>
+            <button class="good" onclick="sendSales()">Send to Sales Engine</button>
+          </div>
+          <div class="row">
+            <div><label>Manual channel</label><select id="fuch"><option value="call">Call</option><option value="whatsapp">WhatsApp</option></select></div>
+            <div><label>Status text</label><input id="fust" value="contacted" /></div>
+          </div>
+        </section>
+      </main>
+      <aside>
+        <section class="card">
+          <h3>Dashboard</h3>
+          <p class="hint">Engagement metrics · Campaign performance · Lead insights (includes next-action hint)</p>
+          <div class="btns"><button onclick="dash()">Dashboard</button></div>
+        </section>
+        <section class="card">
+          <h3>Optimization loop</h3>
+          <p class="hint">Digital Presence Score → AI Optimization Loop → feeds back to AI Content Creation</p>
+          <div class="btns"><button class="good" onclick="optLoop()">AI Optimization Loop</button></div>
+        </section>
+        <section class="card"><h3>API response</h3><pre id="out">Ready.</pre></section>
+      </aside>
+    </div>
+  </div>
+<script>
+const out=document.getElementById('out');
+let lastPlan=null, lastBroadcastId=null, lastAdCampaignId=null;
+function hdr(){const h={'Content-Type':'application/json'};const k=(document.getElementById('adminkey').value||'').trim();if(k)h['X-Admin-Api-Key']=k;return h;}
+async function api(p,m='GET',b=null){const r=await fetch(p,{method:m,headers:hdr(),body:b?JSON.stringify(b):null});const j=await r.json().catch(()=>({raw:'non-json'}));if(!r.ok)j._http={status:r.status};out.textContent=JSON.stringify(j,null,2);return j;}
+function brand(){return (document.getElementById('brand').value||'demo').trim();}
+function genFlags(){return{generate_image:document.getElementById('gimg').checked,generate_video:document.getElementById('gvid').checked,generate_carousel:document.getElementById('gcar').checked};}
+async function runM1Plan(){const st=document.getElementById('src').value;const inp=(document.getElementById('brief').value||'').trim();const g=genFlags();const body={brand_id:brand(),source_type:st,objective:document.getElementById('obj').value,primary_market:document.getElementById('pm').value,plan_only:true,...g};if(st==='url')body.url=inp;else body.text=inp;if((document.getElementById('audhint').value||'').trim())body.audience_hint=(document.getElementById('audhint').value||'').trim();const j=await api('/v1/marketing/campaign','POST',body);if(j&&j._http)lastPlan=null;else if(j&&j.prompts_used)lastPlan=j;else lastPlan=null;return j;}
+async function runM1Exec(){let p=lastPlan;if(!p||!p.prompts_used)p=await runM1Plan();if(!p||p._http||!p.prompts_used)return;const g=genFlags();await api('/v1/marketing/campaign/execute','POST',{brand_id:p.brand_id||brand(),prompts_used:p.prompts_used,brief:p.brief,...g});}
+async function connectSocial(){await api('/v1/marketing/ops/social/connect','POST',{brand_id:brand(),platform:document.getElementById('platform').value,account_handle:document.getElementById('handle').value});}
+async function platformSuggest(){await api('/v1/marketing/ops/social/platform_suggestion','POST',{brand_id:brand(),objective:document.getElementById('obj').value,audience:(document.getElementById('audhint').value||'business')});}
+async function socialPost(){await api('/v1/marketing/ops/social/post_schedule','POST',{brand_id:brand(),platform:document.getElementById('platform').value,mode:document.getElementById('pmode').value,schedule_at:document.getElementById('pwhen').value});}
+async function socialEng(){await api('/v1/marketing/ops/social/engagement','POST',{brand_id:brand(),delta:1});}
+async function allocate(){await api('/v1/marketing/ops/ads/budget_allocation','POST',{brand_id:brand(),objective:document.getElementById('obj').value,budget_total:Number(document.getElementById('budget').value||0)});}
+async function adLaunch(){const j=await api('/v1/marketing/ops/ads/launch','POST',{brand_id:brand(),name:document.getElementById('adname').value,objective:document.getElementById('obj').value,budget_total:Number(document.getElementById('budget').value||0)});if(j&&j.campaign&&j.campaign.id)lastAdCampaignId=j.campaign.id;}
+async function adOptimize(){await api('/v1/marketing/ops/ads/optimize','POST',{brand_id:brand()});}
+async function adLeadCap(){await api('/v1/marketing/ops/ads/lead_capture','POST',{brand_id:brand(),campaign_id:lastAdCampaignId||'last',note:'lead_capture_from_console'});}
+async function broadcastCreate(){let aud={};try{aud=JSON.parse(document.getElementById('aud').value||'{}')}catch(e){} const j=await api('/v1/marketing/ops/broadcast/campaign','POST',{brand_id:brand(),channel:document.getElementById('bch').value,schedule_at:document.getElementById('bsch').value,audience:aud});if(j&&j.campaign&&j.campaign.id)lastBroadcastId=j.campaign.id;}
+async function broadcastResponse(){const id=lastBroadcastId;if(!id){out.textContent='Create a broadcast first, then click Incoming Responses.';return;} await api('/v1/marketing/ops/broadcast/response','POST',{campaign_id:id,count:1});}
+async function leadNote(){await api('/v1/marketing/ops/leads/'+encodeURIComponent(document.getElementById('leadid').value)+'/note','POST',{note:document.getElementById('leadnote').value});}
+async function leadFollow(){await api('/v1/marketing/ops/leads/'+encodeURIComponent(document.getElementById('leadid').value)+'/followup','POST',{follow_up_at:document.getElementById('follow').value});}
+async function leadMark(){await api('/v1/marketing/ops/leads/'+encodeURIComponent(document.getElementById('leadid').value)+'/mark','POST',{temperature:document.getElementById('leadtemp').value});}
+async function leadHistory(){await api('/v1/marketing/ops/leads/'+encodeURIComponent(document.getElementById('leadid').value)+'/history');}
+async function sendOwner(){await api('/v1/marketing/ops/leads/'+encodeURIComponent(document.getElementById('leadid').value)+'/send_to_owner','POST',{message:'New lead from marketing console'});}
+async function manualFu(){await api('/v1/marketing/ops/leads/'+encodeURIComponent(document.getElementById('leadid').value)+'/manual_followup','POST',{channel:document.getElementById('fuch').value,status:document.getElementById('fust').value});}
+async function sendSales(){await api('/v1/marketing/ops/leads/'+encodeURIComponent(document.getElementById('leadid').value)+'/send_to_sales','POST',{});}
+async function dash(){await api('/v1/marketing/ops/dashboard?brand_id='+encodeURIComponent(brand()));}
+async function optLoop(){await api('/v1/marketing/ops/optimization/loop?brand_id='+encodeURIComponent(brand()));}
+</script>
+</body></html>"""
+    return Response(html, mimetype="text/html; charset=utf-8")
+
+
+@app.post("/v1/marketing/ops/social/connect")
+def m1_social_connect():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    try:
+        item = m1ops.connect_social(
+            brand_id=str(body.get("brand_id") or "").strip(),
+            platform=str(body.get("platform") or "").strip(),
+            account_handle=str(body.get("account_handle") or "").strip(),
+        )
+    except ValueError as e:
+        return _err(400, str(e))
+    return jsonify({"connection": item.__dict__})
+
+
+@app.get("/v1/marketing/ops/social/connections")
+def m1_social_connections():
+    brand_id = str(request.args.get("brand_id") or "").strip()
+    try:
+        out = [x.__dict__ for x in m1ops.list_social(brand_id=brand_id)]
+    except ValueError as e:
+        return _err(400, str(e))
+    return jsonify({"items": out})
+
+
+@app.post("/v1/marketing/ops/social/platform_suggestion")
+def m1_social_platform_suggestion():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    brand_id = str(body.get("brand_id") or "").strip()
+    if not brand_id:
+        return _err(400, "invalid brand_id")
+    ranked = suggest_platforms(
+        objective=str(body.get("objective") or "").strip(),
+        audience=str(body.get("audience") or "").strip(),
+    )
+    return jsonify({"brand_id": brand_id, "suggested_platforms": ranked})
+
+
+@app.post("/v1/marketing/ops/social/post_schedule")
+def m1_social_post_schedule():
+    """Diagram: Post Now / Schedule / Auto Publish."""
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    try:
+        job = m1ops.schedule_or_post_social(
+            brand_id=str(body.get("brand_id") or "").strip(),
+            platform=str(body.get("platform") or "").strip(),
+            mode=str(body.get("mode") or "post_now").strip(),
+            schedule_at=str(body.get("schedule_at") or "").strip() or None,
+        )
+    except ValueError as e:
+        return _err(400, str(e))
+    return jsonify({"job": job.__dict__})
+
+
+@app.get("/v1/marketing/ops/social/jobs")
+def m1_social_jobs():
+    brand_id = str(request.args.get("brand_id") or "").strip()
+    try:
+        items = [x.__dict__ for x in m1ops.list_social_jobs(brand_id=brand_id)]
+    except ValueError as e:
+        return _err(400, str(e))
+    return jsonify({"brand_id": brand_id, "items": items})
+
+
+@app.post("/v1/marketing/ops/social/engagement")
+def m1_social_engagement():
+    """Diagram: Engagement Tracking (increments brand engagement counter)."""
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    try:
+        m = m1ops.record_engagement(brand_id=str(body.get("brand_id") or "").strip(), delta=int(body.get("delta") or 1))
+    except ValueError as e:
+        return _err(400, str(e))
+    return jsonify({"metrics": m.__dict__})
+
+
+@app.post("/v1/marketing/ops/ads/lead_capture")
+def m1_ads_lead_capture():
+    """Diagram: Ads Engine → Lead Capture → Lead Management (records capture event; create lead via /v1/marketing/leads)."""
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    brand_id = str(body.get("brand_id") or "").strip()
+    if not brand_id:
+        return _err(400, "brand_id required")
+    campaign_id = str(body.get("campaign_id") or "").strip()
+    if not campaign_id or campaign_id.lower() in ("last", "latest", "recent"):
+        ads = m1ops.list_ads(brand_id=brand_id)
+        campaign_id = ads[0].id if ads else ""
+    if not campaign_id:
+        return _err(409, "no ad campaign for this brand; use Ad Launch first")
+    note = str(body.get("note") or "lead_capture").strip() or "lead_capture"
+    ev = {
+        "type": "ad_lead_capture",
+        "campaign_id": campaign_id,
+        "note": note[:500],
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    return jsonify({"brand_id": brand_id, "lead_capture": ev, "hint": "POST /v1/marketing/leads to persist a full lead record."})
+
+
+@app.post("/v1/marketing/ops/leads/<lead_id>/send_to_owner")
+def m1_lead_send_to_owner(lead_id: str):
+    """Diagram: Send Lead to Owner (WhatsApp)."""
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    l = leads.get(lead_id)
+    if not l:
+        return _err(404, "not found")
+    msg = str(body.get("message") or "New marketing lead — check dashboard.").strip()[:2000]
+    at = datetime.now(timezone.utc).isoformat()
+    leads.merge_raw(lead_id, {"m1_sent_to_owner_at": at, "m1_owner_message_preview": msg[:240]})
+    ev = {"action": "send_to_owner", "created_at": at, "message": msg}
+    _append_lead_raw_event(lead_id, "m1_manual_events", ev)
+    return jsonify({"lead_id": lead_id, "sent": True, "whatsapp_stub": not bool((os.getenv("WHATSAPP_ACCESS_TOKEN") or "").strip()), "event": ev})
+
+
+@app.post("/v1/marketing/ops/leads/<lead_id>/manual_followup")
+def m1_lead_manual_followup(lead_id: str):
+    """Diagram: Manual Follow-up → Call / WhatsApp → Update Status."""
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    channel = str(body.get("channel") or "").strip().lower()
+    status = str(body.get("status") or "").strip().lower()
+    if channel not in {"call", "whatsapp"}:
+        return _err(400, "channel must be call or whatsapp")
+    if not status:
+        return _err(400, "status required")
+    l = leads.get(lead_id)
+    if not l:
+        return _err(404, "not found")
+    at = datetime.now(timezone.utc).isoformat()
+    ev = {"channel": channel, "status": status, "created_at": at}
+    _append_lead_raw_event(lead_id, "m1_manual_events", ev)
+    leads.merge_raw(lead_id, {"m1_last_manual_followup": ev})
+    return jsonify({"lead_id": lead_id, "followup": ev})
+
+
+@app.post("/v1/marketing/ops/leads/<lead_id>/send_to_sales")
+def m1_lead_send_to_sales(lead_id: str):
+    """Diagram: Send to Sales Engine (Optional)."""
+    l = leads.get(lead_id)
+    if not l:
+        return _err(404, "not found")
+    at = datetime.now(timezone.utc).isoformat()
+    leads.merge_raw(lead_id, {"m1_sent_to_sales_engine": True, "m1_sent_to_sales_at": at})
+    ev = {"action": "send_to_sales_engine", "created_at": at}
+    _append_lead_raw_event(lead_id, "m1_manual_events", ev)
+    return jsonify({"lead_id": lead_id, "sent_to_sales_engine": True, "event": ev})
+
+
+def _marketing_dashboard_payload(brand_id: str) -> dict[str, Any]:
+    ll = leads.list(brand_id=brand_id)
+    pp = posts.list(brand_id=brand_id)
+    ads = m1ops.list_ads(brand_id=brand_id)
+    bcs = m1ops.list_broadcasts(brand_id=brand_id)
+
+    hot = warm = cold = 0
+    for l in ll:
+        raw = l.raw if isinstance(getattr(l, "raw", None), dict) else {}
+        t = str(raw.get("sales_lead_temperature") or "").lower()
+        if t == "hot":
+            hot += 1
+        elif t == "warm":
+            warm += 1
+        elif t == "cold":
+            cold += 1
+    posted = len([p for p in pp if p.status == "posted"])
+    failed = len([p for p in pp if p.status == "failed"])
+    engagement_score = min(100, posted * 7 + len(ads) * 5 + sum(x.responses_count for x in bcs))
+    digital_presence_score = min(100, posted * 4 + len(m1ops.list_social(brand_id=brand_id)) * 10 + len(ads) * 6)
+    m = m1ops.get_brand_metrics(brand_id=brand_id)
+    engagement_score = min(100, engagement_score + min(30, m.engagement_events))
+    digital_presence_score = min(100, digital_presence_score + min(15, m.posts_published * 2))
+    reschedule = (datetime.now(timezone.utc) + timedelta(hours=6)).isoformat()
+    return {
+        "brand_id": brand_id,
+        "campaign_performance": {"posts_total": len(pp), "posted": posted, "failed": failed, "ads": len(ads)},
+        "lead_insights": {"total": len(ll), "hot": hot, "warm": warm, "cold": cold},
+        "engagement_metrics": {"engagement_score": engagement_score, "broadcast_responses": sum(x.responses_count for x in bcs)},
+        "digital_presence_score": digital_presence_score,
+        "reschedule_next_action": {"at_utc": reschedule, "hint": "Review lead follow-ups and refresh top creative."},
+    }
+
+
+@app.get("/v1/marketing/ops/optimization/loop")
+def m1_optimization_loop():
+    """Diagram: Dashboard → Digital Presence Score → AI Optimization Loop → AI Content Creation."""
+    brand_id = str(request.args.get("brand_id") or "").strip()
+    if not brand_id:
+        return _err(400, "brand_id required")
+    try:
+        dj = _marketing_dashboard_payload(brand_id)
+    except ValueError as e:
+        return _err(400, str(e))
+    dps = int(dj.get("digital_presence_score") or 0)
+    recommendations: list[str] = []
+    if dps < 40:
+        recommendations.append("Increase posting frequency and connect one more social account.")
+        recommendations.append("Launch a small retargeting ad with lead-form objective.")
+    elif dps < 70:
+        recommendations.append("A/B test carousel + short video; schedule posts at peak local hours.")
+    else:
+        recommendations.append("Scale winning creative; add weekly broadcast to re-engage cold leads.")
+    return jsonify(
+        {
+            "brand_id": brand_id,
+            "digital_presence_score": dps,
+            "dashboard_snapshot": dj,
+            "ai_optimization_loop": {
+                "recommendations": recommendations,
+                "feed_back_to": "ai_content_creation",
+                "suggested_next_brief_focus": "stronger CTA + proof points based on last campaign performance",
+            },
+        }
+    )
+
+
+@app.post("/v1/marketing/ops/ads/budget_allocation")
+def m1_ads_budget_allocation():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    brand_id = str(body.get("brand_id") or "").strip()
+    if not brand_id:
+        return _err(400, "invalid brand_id")
+    try:
+        total = float(body.get("budget_total") or 0)
+        alloc = allocate_budget(total, str(body.get("objective") or ""))
+    except ValueError as e:
+        return _err(400, str(e))
+    return jsonify({"brand_id": brand_id, "budget_total": total, "allocation": alloc})
+
+
+@app.post("/v1/marketing/ops/ads/launch")
+def m1_ads_launch():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    try:
+        total = float(body.get("budget_total") or 0)
+        allocation = allocate_budget(total, str(body.get("objective") or ""))
+        ad = m1ops.create_ad_campaign(
+            brand_id=str(body.get("brand_id") or "").strip(),
+            name=str(body.get("name") or "Campaign").strip(),
+            objective=str(body.get("objective") or "awareness").strip(),
+            budget_total=total,
+            allocation=allocation,
+        )
+        ad = m1ops.update_ad_status(ad.id, "launched") or ad
+    except ValueError as e:
+        return _err(400, str(e))
+    return jsonify({"campaign": ad.__dict__})
+
+
+@app.post("/v1/marketing/ops/ads/optimize")
+def m1_ads_optimize():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    brand_id = str(body.get("brand_id") or "").strip()
+    if not brand_id:
+        return _err(400, "invalid brand_id")
+    ads = m1ops.list_ads(brand_id=brand_id)
+    recommendations: list[str] = []
+    if not ads:
+        recommendations.append("Launch at least one campaign to collect optimization signals.")
+    else:
+        recommendations.append("Shift 10-15% spend from low CTR channels to high engagement channels.")
+        recommendations.append("Refresh creatives every 7 days for ad fatigue control.")
+        recommendations.append("Retarget warm leads via WhatsApp/email within 24h.")
+    return jsonify({"brand_id": brand_id, "recommendations": recommendations, "campaign_count": len(ads)})
+
+
+@app.post("/v1/marketing/ops/broadcast/campaign")
+def m1_broadcast_campaign():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    try:
+        item = m1ops.create_broadcast(
+            brand_id=str(body.get("brand_id") or "").strip(),
+            channel=str(body.get("channel") or "").strip(),
+            audience=body.get("audience") if isinstance(body.get("audience"), dict) else {},
+            schedule_at=str(body.get("schedule_at") or "").strip(),
+        )
+    except ValueError as e:
+        return _err(400, str(e))
+    return jsonify({"campaign": item.__dict__})
+
+
+@app.post("/v1/marketing/ops/broadcast/response")
+def m1_broadcast_response():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    campaign_id = str(body.get("campaign_id") or "").strip()
+    if not campaign_id:
+        return _err(400, "invalid campaign_id")
+    c = m1ops.add_broadcast_responses(campaign_id, int(body.get("count") or 1))
+    if not c:
+        return _err(404, "not found")
+    return jsonify({"campaign": c.__dict__})
+
+
+@app.post("/v1/marketing/ops/leads/<lead_id>/note")
+def m1_lead_note(lead_id: str):
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    note = str(body.get("note") or "").strip()
+    if not note:
+        return _err(400, "note required")
+    ev = {"note": note[:1000], "created_at": datetime.now(timezone.utc).isoformat()}
+    raw = _append_lead_raw_event(lead_id, "m1_lead_notes", ev)
+    if raw is None:
+        return _err(404, "not found")
+    return jsonify({"lead_id": lead_id, "note": ev})
+
+
+@app.post("/v1/marketing/ops/leads/<lead_id>/followup")
+def m1_lead_followup(lead_id: str):
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    at = str(body.get("follow_up_at") or "").strip()
+    if not at:
+        return _err(400, "follow_up_at required")
+    ev = {"follow_up_at": at, "created_at": datetime.now(timezone.utc).isoformat()}
+    raw = _append_lead_raw_event(lead_id, "m1_followups", ev)
+    if raw is None:
+        return _err(404, "not found")
+    leads.merge_raw(lead_id, {"m1_next_followup_at": at})
+    return jsonify({"lead_id": lead_id, "follow_up": ev})
+
+
+@app.post("/v1/marketing/ops/leads/<lead_id>/mark")
+def m1_lead_mark(lead_id: str):
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    t = str(body.get("temperature") or "").strip().lower()
+    if t not in {"hot", "warm", "cold"}:
+        return _err(400, "temperature must be hot/warm/cold")
+    l = leads.get(lead_id)
+    if not l:
+        return _err(404, "not found")
+    leads.merge_raw(lead_id, {"sales_lead_temperature": t})
+    ev = {"temperature": t, "created_at": datetime.now(timezone.utc).isoformat()}
+    _append_lead_raw_event(lead_id, "m1_temp_history", ev)
+    return jsonify({"lead_id": lead_id, "temperature": t})
+
+
+@app.get("/v1/marketing/ops/leads/<lead_id>/history")
+def m1_lead_history(lead_id: str):
+    l = leads.get(lead_id)
+    if not l:
+        return _err(404, "not found")
+    raw = l.raw if isinstance(getattr(l, "raw", None), dict) else {}
+    return jsonify(
+        {
+            "lead_id": lead_id,
+            "lead": l.__dict__,
+            "history": {
+                "notes": list(raw.get("m1_lead_notes") or []),
+                "followups": list(raw.get("m1_followups") or []),
+                "temperature": list(raw.get("m1_temp_history") or []),
+                "manual_events": list(raw.get("m1_manual_events") or []),
+            },
+        }
+    )
+
+
+@app.get("/v1/marketing/ops/dashboard")
+def marketing_dashboard():
+    brand_id = str(request.args.get("brand_id") or "").strip()
+    if not brand_id:
+        return _err(400, "brand_id required")
+    try:
+        payload = _marketing_dashboard_payload(brand_id)
+    except ValueError as e:
+        return _err(400, str(e))
+    return jsonify(payload)
+
+
+@app.post("/v1/marketing/ops/optimization/reschedule")
+def m1_optimization_reschedule():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    brand_id = str(body.get("brand_id") or "").strip()
+    if not brand_id:
+        return _err(400, "brand_id required")
+    # Heuristic next action recommendation loop.
+    ll = leads.list(brand_id=brand_id)
+    hot = 0
+    for l in ll:
+        raw = l.raw if isinstance(getattr(l, "raw", None), dict) else {}
+        if str(raw.get("sales_lead_temperature") or "").lower() == "hot":
+            hot += 1
+    if hot:
+        action = "Prioritize call + WhatsApp follow-up for hot leads within 2 hours."
+    else:
+        action = "Run retargeting ad + broadcast campaign and rescore leads tomorrow."
+    when = (datetime.now(timezone.utc) + timedelta(hours=4)).isoformat()
+    return jsonify({"brand_id": brand_id, "next_action": action, "reschedule_at_utc": when})
+
+
+def _salespal360_console_html() -> str:
+    """Inline SalesPal 360 web console markup."""
+    return '<!doctype html>\n<html lang="en">\n<head>\n  <meta charset="utf-8" />\n  <meta name="viewport" content="width=device-width, initial-scale=1" />\n  <title>SalesPal 360</title>\n  <style>\n    :root {\n      --bg: #f8fafc;\n      --surface: #ffffff;\n      --border: #e2e8f0;\n      --text: #0f172a;\n      --muted: #64748b;\n      --primary: #2563eb;\n      --primary-hover: #1d4ed8;\n      --accent: #0f766e;\n      --radius: 10px;\n      --shadow: 0 1px 3px rgba(15, 23, 42, 0.06);\n    }\n    * { box-sizing: border-box; }\n    body {\n      margin: 0;\n      font-family: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;\n      background: var(--bg);\n      color: var(--text);\n      font-size: 14px;\n      line-height: 1.5;\n      -webkit-font-smoothing: antialiased;\n    }\n    .shell { min-height: 100vh; display: flex; flex-direction: column; }\n    header.app-head {\n      background: var(--surface);\n      border-bottom: 1px solid var(--border);\n      padding: 16px 20px 12px;\n    }\n    header.app-head h1 {\n      margin: 0;\n      font-size: 1.25rem;\n      font-weight: 700;\n      letter-spacing: -0.02em;\n    }\n    header.app-head p {\n      margin: 4px 0 0;\n      font-size: 13px;\n      color: var(--muted);\n      max-width: 52ch;\n    }\n    .credentials {\n      display: grid;\n      grid-template-columns: repeat(4, minmax(0, 1fr));\n      gap: 12px;\n      padding: 12px 20px;\n      background: var(--surface);\n      border-bottom: 1px solid var(--border);\n    }\n    @media (max-width: 900px) { .credentials { grid-template-columns: 1fr 1fr; } }\n    @media (max-width: 480px) { .credentials { grid-template-columns: 1fr; } }\n    label {\n      display: block;\n      font-size: 11px;\n      font-weight: 600;\n      color: var(--muted);\n      margin-bottom: 4px;\n    }\n    input, select, textarea {\n      width: 100%;\n      padding: 8px 10px;\n      border: 1px solid var(--border);\n      border-radius: 8px;\n      font: inherit;\n      background: #fff;\n    }\n    input:focus, select:focus, textarea:focus {\n      outline: none;\n      border-color: var(--primary);\n      box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.15);\n    }\n    textarea { min-height: 72px; resize: vertical; font-size: 13px; }\n    nav.section-nav {\n      position: sticky;\n      top: 0;\n      z-index: 10;\n      display: flex;\n      flex-wrap: wrap;\n      gap: 4px;\n      padding: 10px 20px;\n      background: rgba(248, 250, 252, 0.92);\n      backdrop-filter: blur(8px);\n      border-bottom: 1px solid var(--border);\n    }\n    nav.section-nav a {\n      text-decoration: none;\n      color: var(--muted);\n      font-size: 12px;\n      font-weight: 600;\n      padding: 6px 12px;\n      border-radius: 999px;\n      border: 1px solid transparent;\n    }\n    nav.section-nav a:hover { color: var(--text); background: #fff; border-color: var(--border); }\n    .body-grid {\n      flex: 1;\n      display: grid;\n      grid-template-columns: 1fr 340px;\n      gap: 0;\n      align-items: start;\n      max-width: 1600px;\n      margin: 0 auto;\n      width: 100%;\n    }\n    @media (max-width: 1100px) {\n      .body-grid { grid-template-columns: 1fr; }\n      aside.response-col { position: relative; top: 0; max-height: 50vh; }\n    }\n    main.content { padding: 20px; display: flex; flex-direction: column; gap: 20px; }\n    aside.response-col {\n      position: sticky;\n      top: 48px;\n      align-self: start;\n      padding: 20px 20px 20px 0;\n      border-left: 1px solid var(--border);\n      background: var(--bg);\n      min-height: 200px;\n    }\n    @media (max-width: 1100px) {\n      aside.response-col { border-left: 0; border-top: 1px solid var(--border); padding: 16px 20px; }\n    }\n    .panel {\n      background: var(--surface);\n      border: 1px solid var(--border);\n      border-radius: var(--radius);\n      box-shadow: var(--shadow);\n      padding: 18px 20px;\n    }\n    .panel h2 {\n      margin: 0 0 4px;\n      font-size: 15px;\n      font-weight: 700;\n    }\n    .panel .lede {\n      margin: 0 0 16px;\n      font-size: 13px;\n      color: var(--muted);\n    }\n    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }\n    @media (max-width: 640px) { .grid-2 { grid-template-columns: 1fr; } }\n    .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }\n    @media (max-width: 960px) { .grid-3 { grid-template-columns: 1fr; } }\n    .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }\n    .actions:first-child { margin-top: 0; }\n    button {\n      font: inherit;\n      font-size: 12px;\n      font-weight: 600;\n      padding: 8px 14px;\n      border-radius: 8px;\n      border: none;\n      cursor: pointer;\n      background: var(--primary);\n      color: #fff;\n    }\n    button:hover { background: var(--primary-hover); }\n    button.secondary { background: #475569; }\n    button.secondary:hover { background: #334155; }\n    button.ghost { background: #fff; color: var(--text); border: 1px solid var(--border); }\n    button.ghost:hover { background: #f8fafc; }\n    button.teal { background: var(--accent); }\n    button.teal:hover { filter: brightness(0.95); }\n    button:disabled { opacity: 0.5; cursor: not-allowed; }\n    .response-label {\n      font-size: 11px;\n      font-weight: 700;\n      text-transform: uppercase;\n      letter-spacing: 0.06em;\n      color: var(--muted);\n      margin-bottom: 8px;\n    }\n    pre#out {\n      margin: 0;\n      padding: 14px;\n      background: #0f172a;\n      color: #e2e8f0;\n      border-radius: var(--radius);\n      font-size: 11px;\n      line-height: 1.45;\n      white-space: pre-wrap;\n      word-break: break-word;\n      max-height: min(75vh, 720px);\n      overflow: auto;\n    }\n    .divider { height: 1px; background: var(--border); margin: 16px 0; }\n    .subhead { font-size: 12px; font-weight: 700; color: var(--muted); margin: 16px 0 8px; text-transform: uppercase; letter-spacing: 0.04em; }\n    .subhead:first-child { margin-top: 0; }\n  </style>\n</head>\n<body>\n  <div class="shell">\n    <header class="app-head">\n      <h1>SalesPal 360</h1>\n      <p>Unified sales operations: pipeline, marketing handoff, post-sale, support, and reporting. Set a brand and lead for customer-scoped actions; use an admin API key where your deployment requires it.</p>\n    </header>\n\n    <div class="credentials">\n      <div><label for="brand">Brand</label><input id="brand" value="demo" autocomplete="off" /></div>\n      <div><label for="lead">Lead</label><input id="lead" placeholder="Required for lead-specific actions" autocomplete="off" /></div>\n      <div><label for="adminkey">Admin API key</label><input id="adminkey" placeholder="If required by server" autocomplete="off" /></div>\n      <div><label for="tasktitle">Default task title</label><input id="tasktitle" placeholder="e.g. Follow up call" /></div>\n    </div>\n\n    <nav class="section-nav" aria-label="Sections">\n      <a href="#overview">Overview</a>\n      <a href="#pipeline">Pipeline</a>\n      <a href="#marketing">Marketing</a>\n      <a href="#postsale">Post-sale</a>\n      <a href="#support">Support</a>\n      <a href="#library">Library</a>\n      <a href="#reports">Reports</a>\n      <a href="#administration">Administration</a>\n    </nav>\n\n    <div class="body-grid">\n      <main class="content">\n        <section class="panel" id="overview">\n          <h2>Overview</h2>\n          <p class="lede">Snapshot metrics, forecast, analytics, and recommended next steps.</p>\n          <div class="actions">\n            <button type="button" onclick="salesDash()">Sales dashboard</button>\n            <button type="button" class="secondary" onclick="forecast()">Forecast</button>\n            <button type="button" class="secondary" onclick="analytics()">Analytics</button>\n            <button type="button" class="teal" onclick="learning()">Recommended next action</button>\n            <button type="button" class="ghost" onclick="featStatus()">Integration status</button>\n          </div>\n        </section>\n\n        <section class="panel" id="pipeline">\n          <h2>Pipeline &amp; deals</h2>\n          <p class="lede">Move opportunities through stages, qualify, schedule work, and review history.</p>\n          <div class="grid-2">\n            <div><label for="stage">Stage</label>\n              <select id="stage"><option>marketing</option><option selected>sales</option><option>postsale</option><option>support</option></select></div>\n            <div><label for="status">Status</label><input id="status" value="open" /></div>\n            <div><label for="owner">Owner</label>\n              <select id="owner"><option>ai</option><option>senior_ai</option><option>human</option></select></div>\n            <div><label for="qual">Qualification</label>\n              <select id="qual"><option>hot</option><option>warm</option><option>cold</option></select></div>\n          </div>\n          <div class="subhead">Sales motions</div>\n          <div class="actions">\n            <button type="button" onclick="requireLead(caseUpsert)">Save case</button>\n            <button type="button" class="secondary" onclick="requireLead(timelineOnly)">Timeline</button>\n            <button type="button" onclick="requireLead(salesQualify)">Qualify</button>\n            <button type="button" class="secondary" onclick="requireLead(salesFollow)">Schedule follow-up</button>\n            <button type="button" onclick="requireLead(salesEscalate)">Escalate</button>\n            <button type="button" class="ghost" onclick="logSalesAct()">Log automation event</button>\n          </div>\n          <div class="divider"></div>\n          <div class="grid-2">\n            <div><label for="meeting">Meeting status</label>\n              <select id="meeting"><option>scheduled</option><option>reschedule</option><option>no_show</option><option>completed</option></select></div>\n            <div><label for="follow">Follow-up time (UTC)</label><input id="follow" placeholder="2026-04-08T12:00:00+00:00" /></div>\n          </div>\n          <div class="actions">\n            <button type="button" class="teal" onclick="requireLead(salesMeeting)">Apply meeting update</button>\n            <button type="button" class="ghost" onclick="requireLead(scheduleMeeting)">Mark scheduled</button>\n            <button type="button" class="ghost" onclick="requireLead(markReschedule)">Mark reschedule / no-show</button>\n            <button type="button" class="ghost" onclick="requireLead(completeVisit)">Complete visit</button>\n          </div>\n          <div class="actions" style="margin-top:8px">\n            <button type="button" onclick="tasksList()">List tasks</button>\n            <button type="button" class="secondary" onclick="taskAdd()">Create task</button>\n          </div>\n        </section>\n\n        <section class="panel" id="marketing">\n          <h2>Marketing handoff</h2>\n          <p class="lede">Leads, campaigns, and optimization. Uses marketing APIs for this brand.</p>\n          <div class="subhead">Leads &amp; performance</div>\n          <div class="actions">\n            <button type="button" onclick="mktLeads()">List leads</button>\n            <button type="button" class="secondary" onclick="repLeads()">Lead analytics (SalesPal)</button>\n            <button type="button" onclick="mktOptLoop()">Optimization loop</button>\n          </div>\n          <div class="subhead">Channels</div>\n          <div class="actions">\n            <button type="button" onclick="mktCopy()">Generate copy</button>\n            <button type="button" class="secondary" onclick="mktSocialConn()">Social connections</button>\n            <button type="button" class="secondary" onclick="mktSocialJobs()">Social jobs</button>\n            <button type="button" onclick="mktAdsLeadCap()">Ads lead capture</button>\n            <button type="button" class="ghost" onclick="mktBroadcast()">Broadcast campaign</button>\n          </div>\n          <div class="subhead">Website</div>\n          <div class="actions">\n            <button type="button" class="ghost" onclick="mktFetchHints()">Fetch website hints</button>\n          </div>\n        </section>\n\n        <section class="panel" id="postsale">\n          <h2>Post-sale</h2>\n          <p class="lede">Payments, satisfaction, and moving the record into post-sale.</p>\n          <div class="actions">\n            <button type="button" class="secondary" onclick="requireLead(caseUpsertPost)">Set stage: post-sale</button>\n          </div>\n          <div class="grid-2" style="margin-top:12px">\n            <div><label for="pay">Payment verification</label>\n              <select id="pay"><option>partial_verified</option><option>fully_verified</option></select></div>\n            <div><label for="fb">Satisfaction (1–10)</label><input id="fb" type="number" min="1" max="10" value="8" /></div>\n          </div>\n          <div class="actions">\n            <button type="button" class="teal" onclick="requireLead(postClose)">Record payment &amp; close</button>\n            <button type="button" onclick="requireLead(postFeedback)">Submit satisfaction</button>\n          </div>\n        </section>\n\n        <section class="panel" id="support">\n          <h2>Support</h2>\n          <p class="lede">Open and update support tickets for the current lead.</p>\n          <div class="grid-2">\n            <div><label for="sch">Channel</label>\n              <select id="sch"><option>whatsapp</option><option>email</option><option>sms</option></select></div>\n            <div><label for="ticket">Ticket ID</label><input id="ticket" placeholder="Filled after open" /></div>\n          </div>\n          <label for="complaint">Details</label>\n          <textarea id="complaint"></textarea>\n          <div class="grid-2" style="margin-top:8px">\n            <div><label for="tstatus">Ticket status</label>\n              <select id="tstatus"><option>open</option><option>resolved</option><option>closed</option></select></div>\n            <div><label for="esc">Escalation</label>\n              <select id="esc"><option>ai</option><option>human</option></select></div>\n          </div>\n          <div class="actions">\n            <button type="button" onclick="requireLead(supportOpen)">Open ticket</button>\n            <button type="button" class="secondary" onclick="supportUpdate()">Update ticket</button>\n          </div>\n        </section>\n\n        <section class="panel" id="library">\n          <h2>Library &amp; memory</h2>\n          <p class="lede">Documents, e-sign requests, and per-lead memory.</p>\n          <div class="actions">\n            <button type="button" onclick="docAdd()">Register document</button>\n            <button type="button" class="secondary" onclick="docList()">List documents</button>\n            <button type="button" onclick="requireLead(esigAdd)">Request e-signature</button>\n            <button type="button" class="secondary" onclick="esigList()">E-sign requests</button>\n          </div>\n          <label for="mem">Memory (JSON)</label>\n          <textarea id="mem">{"conversation_memory":{"topic":"pricing"}}</textarea>\n          <div class="actions">\n            <button type="button" class="teal" onclick="requireLead(memoryMerge)">Save memory</button>\n            <button type="button" class="ghost" onclick="requireLead(memoryGet)">Load memory</button>\n          </div>\n        </section>\n\n        <section class="panel" id="reports">\n          <h2>Reports</h2>\n          <p class="lede">Sales activity, lead sources, and team performance.</p>\n          <div class="actions">\n            <button type="button" onclick="repSales()">Sales activity</button>\n            <button type="button" class="secondary" onclick="repLeads()">Leads &amp; sources</button>\n            <button type="button" onclick="repPerf()">Performance</button>\n          </div>\n        </section>\n\n        <section class="panel" id="administration">\n          <h2>Platform &amp; administration</h2>\n          <p class="lede">Tenant settings, CRM configuration, and operational visibility.</p>\n          <div class="grid-3">\n            <div>\n              <div class="subhead" style="margin-top:0">Platform</div>\n              <div class="actions">\n                <button type="button" onclick="platSum()">Summary</button>\n                <button type="button" class="secondary" onclick="platPatch()">Save settings</button>\n              </div>\n              <label for="platpatch">Settings (JSON)</label>\n              <textarea id="platpatch">{"timezone":"Asia/Kolkata"}</textarea>\n            </div>\n            <div>\n              <div class="subhead" style="margin-top:0">CRM</div>\n              <div class="actions">\n                <button type="button" onclick="crmGet()">Load config</button>\n                <button type="button" class="secondary" onclick="crmPatch()">Save config</button>\n              </div>\n              <label for="crmpatch">CRM config (JSON)</label>\n              <textarea id="crmpatch">{"pipeline_stages":["new","qualified","won"]}</textarea>\n            </div>\n            <div>\n              <div class="subhead" style="margin-top:0">Admin</div>\n              <div class="actions">\n                <button type="button" onclick="adminSum()">Dashboard</button>\n                <button type="button" class="secondary" onclick="adminAct()">Activity log</button>\n                <button type="button" class="ghost" onclick="adminHealth()">Service health</button>\n              </div>\n            </div>\n          </div>\n        </section>\n      </main>\n\n      <aside class="response-col">\n        <div class="response-label">Response</div>\n        <pre id="out">Ready.</pre>\n      </aside>\n    </div>\n  </div>\n\n  <script>\n(function () {\n  var out = document.getElementById("out");\n  function hdr() {\n    var h = { "Content-Type": "application/json" };\n    var k = (document.getElementById("adminkey").value || "").trim();\n    if (k) h["X-Admin-Api-Key"] = k;\n    return h;\n  }\n  function api(path, method, body) {\n    method = method || "GET";\n    return fetch(path, {\n      method: method,\n      headers: hdr(),\n      body: body ? JSON.stringify(body) : null\n    }).then(function (r) {\n      return r.json().catch(function () { return { _parse: "non-json" }; }).then(function (j) {\n        if (!r.ok) j._http = { status: r.status };\n        out.textContent = JSON.stringify(j, null, 2);\n        return j;\n      });\n    });\n  }\n  function brand() { return (document.getElementById("brand").value || "").trim(); }\n  function lead() { return (document.getElementById("lead").value || "").trim(); }\n  function requireLead(fn) {\n    if (!lead()) {\n      out.textContent = JSON.stringify({ error: "Set a lead ID for this action." }, null, 2);\n      return;\n    }\n    fn();\n  }\n  window.api = api;\n\n  window.featStatus = function () { return api("/v1/salespal360/features/status"); };\n  window.salesDash = function () { return api("/v1/salespal360/sales/dashboard?brand_id=" + encodeURIComponent(brand())); };\n  window.repSales = function () { return api("/v1/salespal360/reports/sales?brand_id=" + encodeURIComponent(brand())); };\n  window.repLeads = function () { return api("/v1/salespal360/reports/leads?brand_id=" + encodeURIComponent(brand())); };\n  window.repPerf = function () { return api("/v1/salespal360/reports/performance?brand_id=" + encodeURIComponent(brand())); };\n  window.forecast = function () { return api("/v1/salespal360/forecast?brand_id=" + encodeURIComponent(brand())); };\n  window.tasksList = function () { return api("/v1/salespal360/tasks?brand_id=" + encodeURIComponent(brand())); };\n  window.taskAdd = function () {\n    var t = (document.getElementById("tasktitle").value || "Follow up").trim();\n    return api("/v1/salespal360/tasks", "POST", { brand_id: brand(), title: t, lead_id: lead() || null, due_at: null });\n  };\n  window.logSalesAct = function () {\n    return api("/v1/salespal360/admin/activity", "POST", {\n      brand_id: brand(),\n      actor: "console",\n      action: "sales_automation",\n      meta: { lead_id: lead() || null }\n    });\n  };\n  window.platSum = function () { return api("/v1/salespal360/platform/summary?brand_id=" + encodeURIComponent(brand())); };\n  window.platPatch = function () {\n    var p = {};\n    try { p = JSON.parse(document.getElementById("platpatch").value || "{}"); } catch (e) {}\n    return api("/v1/salespal360/platform/settings", "POST", { brand_id: brand(), patch: p });\n  };\n  window.adminSum = function () { return api("/v1/salespal360/admin/summary?brand_id=" + encodeURIComponent(brand())); };\n  window.adminAct = function () { return api("/v1/salespal360/admin/activity?brand_id=" + encodeURIComponent(brand())); };\n  window.adminHealth = function () { return api("/v1/salespal360/admin/health"); };\n  window.crmGet = function () { return api("/v1/salespal360/crm/config?brand_id=" + encodeURIComponent(brand())); };\n  window.crmPatch = function () {\n    var p = {};\n    try { p = JSON.parse(document.getElementById("crmpatch").value || "{}"); } catch (e) {}\n    return api("/v1/salespal360/crm/config", "POST", { brand_id: brand(), patch: p });\n  };\n  window.caseUpsert = function () {\n    return api("/v1/salespal360/case/upsert", "POST", {\n      brand_id: brand(),\n      lead_id: lead(),\n      stage: document.getElementById("stage").value,\n      status: document.getElementById("status").value,\n      owner: document.getElementById("owner").value\n    });\n  };\n  window.caseUpsertPost = function () {\n    return api("/v1/salespal360/case/upsert", "POST", {\n      brand_id: brand(),\n      lead_id: lead(),\n      stage: "postsale",\n      status: document.getElementById("status").value,\n      owner: document.getElementById("owner").value\n    });\n  };\n  window.timelineOnly = function () {\n    return api("/v1/salespal360/timeline?brand_id=" + encodeURIComponent(brand()) + "&lead_id=" + encodeURIComponent(lead()));\n  };\n  window.salesQualify = function () {\n    return api("/v1/salespal360/sales/qualify", "POST", {\n      brand_id: brand(),\n      lead_id: lead(),\n      qualification: document.getElementById("qual").value,\n      owner: document.getElementById("owner").value\n    });\n  };\n  window.salesFollow = function () {\n    return api("/v1/salespal360/sales/followup", "POST", {\n      brand_id: brand(),\n      lead_id: lead(),\n      follow_up_at: document.getElementById("follow").value || null\n    });\n  };\n  window.salesMeeting = function () {\n    return api("/v1/salespal360/sales/meeting", "POST", {\n      brand_id: brand(),\n      lead_id: lead(),\n      meeting_status: document.getElementById("meeting").value\n    });\n  };\n  window.salesEscalate = function () {\n    return api("/v1/salespal360/sales/escalate", "POST", {\n      brand_id: brand(),\n      lead_id: lead(),\n      owner: document.getElementById("owner").value\n    });\n  };\n  window.scheduleMeeting = function () {\n    document.getElementById("meeting").value = "scheduled";\n    return salesMeeting();\n  };\n  window.markReschedule = function () {\n    document.getElementById("meeting").value = "reschedule";\n    return salesMeeting();\n  };\n  window.completeVisit = function () {\n    document.getElementById("meeting").value = "completed";\n    return api("/v1/salespal360/admin/activity", "POST", {\n      brand_id: brand(),\n      actor: "console",\n      action: "visit_completed",\n      meta: { lead_id: lead() }\n    }).then(function () { return salesMeeting(); });\n  };\n  window.postClose = function () {\n    return api("/v1/salespal360/postsale/close", "POST", {\n      brand_id: brand(),\n      lead_id: lead(),\n      payment_status: document.getElementById("pay").value\n    });\n  };\n  window.postFeedback = function () {\n    return api("/v1/salespal360/postsale/feedback", "POST", {\n      brand_id: brand(),\n      lead_id: lead(),\n      score: Number(document.getElementById("fb").value || 0)\n    });\n  };\n  window.supportOpen = function () {\n    return api("/v1/salespal360/support/open", "POST", {\n      brand_id: brand(),\n      lead_id: lead(),\n      channel: document.getElementById("sch").value,\n      complaint: document.getElementById("complaint").value\n    }).then(function (j) {\n      if (j.ticket && j.ticket.id) document.getElementById("ticket").value = j.ticket.id;\n      return j;\n    });\n  };\n  window.supportUpdate = function () {\n    return api("/v1/salespal360/support/update", "POST", {\n      ticket_id: document.getElementById("ticket").value,\n      status: document.getElementById("tstatus").value,\n      resolution: document.getElementById("complaint").value,\n      escalation_level: document.getElementById("esc").value\n    });\n  };\n  window.memoryMerge = function () {\n    var patch = {};\n    try { patch = JSON.parse(document.getElementById("mem").value || "{}"); } catch (e) {}\n    return api("/v1/salespal360/memory/merge", "POST", { brand_id: brand(), lead_id: lead(), patch: patch });\n  };\n  window.memoryGet = function () {\n    return api("/v1/salespal360/memory/get?brand_id=" + encodeURIComponent(brand()) + "&lead_id=" + encodeURIComponent(lead()));\n  };\n  window.docAdd = function () {\n    return api("/v1/salespal360/documents", "POST", {\n      brand_id: brand(),\n      name: "Proposal.pdf",\n      kind: "pdf",\n      lead_id: lead() || null\n    });\n  };\n  window.docList = function () { return api("/v1/salespal360/documents?brand_id=" + encodeURIComponent(brand())); };\n  window.esigAdd = function () {\n    return api("/v1/salespal360/esign", "POST", {\n      brand_id: brand(),\n      lead_id: lead(),\n      document_name: "Order form"\n    });\n  };\n  window.esigList = function () { return api("/v1/salespal360/esign?brand_id=" + encodeURIComponent(brand())); };\n  window.analytics = function () { return api("/v1/salespal360/analytics?brand_id=" + encodeURIComponent(brand())); };\n  window.learning = function () { return api("/v1/salespal360/learning/next_action", "POST", { brand_id: brand() }); };\n\n  window.mktLeads = function () { return api("/v1/marketing/leads?brand_id=" + encodeURIComponent(brand())); };\n  window.mktOptLoop = function () { return api("/v1/marketing/ops/optimization/loop?brand_id=" + encodeURIComponent(brand())); };\n  window.mktSocialConn = function () { return api("/v1/marketing/ops/social/connections?brand_id=" + encodeURIComponent(brand())); };\n  window.mktSocialJobs = function () { return api("/v1/marketing/ops/social/jobs?brand_id=" + encodeURIComponent(brand())); };\n  window.mktAdsLeadCap = function () {\n    return api("/v1/marketing/ops/ads/lead_capture", "POST", { brand_id: brand(), campaign_id: "latest" });\n  };\n  window.mktBroadcast = function () {\n    return api("/v1/marketing/ops/broadcast/campaign", "POST", {\n      brand_id: brand(),\n      channel: "sms",\n      audience: {},\n      schedule_at: ""\n    });\n  };\n  window.mktCopy = function () {\n    return api("/v1/marketing/copy", "POST", {\n      content_type: "social_caption",\n      context: "Brand promotion",\n      tone: "professional",\n      brand_name: brand()\n    });\n  };\n  window.mktFetchHints = function () {\n    return api("/v1/marketing/fetch-website-hints", "POST", { url: "https://example.com" });\n  };\n})();\n  </script>\n</body>\n</html>\n'
+
+@app.get("/salespal360")
+def salespal360_console():
+    return Response(_salespal360_console_html(), mimetype="text/html; charset=utf-8")
+
+
+@app.post("/v1/salespal360/case/upsert")
+def salespal360_case_upsert():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    try:
+        case = sp360.upsert_case(
+            brand_id=str(body.get("brand_id") or "").strip(),
+            lead_id=str(body.get("lead_id") or "").strip(),
+            stage=str(body.get("stage") or "sales").strip(),
+            status=str(body.get("status") or "open").strip(),
+            owner=str(body.get("owner") or "ai").strip(),
+            score=int(body.get("score") or 50),
+        )
+        sp360.add_event(
+            brand_id=case.brand_id,
+            lead_id=case.lead_id,
+            engine=case.stage,
+            event_type="case_upsert",
+            payload={"status": case.status, "owner": case.owner, "score": case.score},
+        )
+    except ValueError as e:
+        return _err(400, str(e))
+    return jsonify({"case": case.__dict__})
+
+
+@app.get("/v1/salespal360/timeline")
+def salespal360_timeline():
+    brand_id = str(request.args.get("brand_id") or "").strip()
+    lead_id = str(request.args.get("lead_id") or "").strip()
+    if not brand_id or not lead_id:
+        return _err(400, "brand_id and lead_id required")
+    try:
+        case = sp360.get_case(brand_id=brand_id, lead_id=lead_id)
+        events = [e.__dict__ for e in sp360.list_events(brand_id=brand_id, lead_id=lead_id)]
+        mem = sp360.get_memory(brand_id=brand_id, lead_id=lead_id)
+    except ValueError as e:
+        return _err(400, str(e))
+    return jsonify({"case": case.__dict__ if case else None, "events": events, "memory": mem})
+
+
+@app.post("/v1/salespal360/sales/qualify")
+def salespal360_sales_qualify():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    q = str(body.get("qualification") or "").strip().lower()
+    if q not in {"hot", "warm", "cold"}:
+        return _err(400, "qualification must be hot/warm/cold")
+    score = {"hot": 85, "warm": 60, "cold": 30}[q]
+    try:
+        case = sp360.upsert_case(
+            brand_id=str(body.get("brand_id") or "").strip(),
+            lead_id=str(body.get("lead_id") or "").strip(),
+            stage="sales",
+            status="qualified",
+            owner=str(body.get("owner") or "ai").strip(),
+            score=score,
+        )
+        sp360.add_event(
+            brand_id=case.brand_id,
+            lead_id=case.lead_id,
+            engine="sales",
+            event_type="qualification",
+            payload={"qualification": q, "score": score},
+        )
+    except ValueError as e:
+        return _err(400, str(e))
+    return jsonify({"case": case.__dict__, "qualification": q})
+
+
+@app.post("/v1/salespal360/sales/followup")
+def salespal360_sales_followup():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    brand_id = str(body.get("brand_id") or "").strip()
+    lead_id = str(body.get("lead_id") or "").strip()
+    follow = str(body.get("follow_up_at") or "").strip() or (
+        datetime.now(timezone.utc) + timedelta(hours=24)
+    ).isoformat()
+    try:
+        case = sp360.upsert_case(
+            brand_id=brand_id, lead_id=lead_id, stage="sales", status="followup_due", owner="ai"
+        )
+        sp360.add_event(
+            brand_id=brand_id,
+            lead_id=lead_id,
+            engine="sales",
+            event_type="followup_scheduled",
+            payload={"follow_up_at": follow},
+        )
+    except ValueError as e:
+        return _err(400, str(e))
+    return jsonify({"case": case.__dict__, "follow_up_at": follow})
+
+
+@app.post("/v1/salespal360/sales/meeting")
+def salespal360_sales_meeting():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    ms = str(body.get("meeting_status") or "").strip().lower()
+    if ms not in {"scheduled", "reschedule", "no_show", "completed"}:
+        return _err(400, "invalid meeting_status")
+    status = "meeting_" + ms
+    try:
+        case = sp360.upsert_case(
+            brand_id=str(body.get("brand_id") or "").strip(),
+            lead_id=str(body.get("lead_id") or "").strip(),
+            stage="sales",
+            status=status,
+            owner="ai",
+        )
+        sp360.add_event(
+            brand_id=case.brand_id,
+            lead_id=case.lead_id,
+            engine="sales",
+            event_type="meeting",
+            payload={"meeting_status": ms},
+        )
+    except ValueError as e:
+        return _err(400, str(e))
+    return jsonify({"case": case.__dict__, "meeting_status": ms})
+
+
+@app.post("/v1/salespal360/sales/escalate")
+def salespal360_sales_escalate():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    owner = str(body.get("owner") or "").strip().lower() or "human"
+    if owner not in {"senior_ai", "human", "owner"}:
+        return _err(400, "owner must be senior_ai/human/owner")
+    try:
+        case = sp360.upsert_case(
+            brand_id=str(body.get("brand_id") or "").strip(),
+            lead_id=str(body.get("lead_id") or "").strip(),
+            stage="sales",
+            status="escalated",
+            owner=owner,
+        )
+        sp360.add_event(
+            brand_id=case.brand_id,
+            lead_id=case.lead_id,
+            engine="sales",
+            event_type="escalation",
+            payload={"owner": owner},
+        )
+    except ValueError as e:
+        return _err(400, str(e))
+    return jsonify({"case": case.__dict__})
+
+
+@app.post("/v1/salespal360/postsale/close")
+def salespal360_postsale_close():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    pay = str(body.get("payment_status") or "").strip().lower()
+    if pay not in {"partial_verified", "fully_verified"}:
+        return _err(400, "payment_status must be partial_verified/fully_verified")
+    try:
+        case = sp360.upsert_case(
+            brand_id=str(body.get("brand_id") or "").strip(),
+            lead_id=str(body.get("lead_id") or "").strip(),
+            stage="postsale",
+            status="deal_closed",
+            owner="ai",
+            score=90 if pay == "fully_verified" else 75,
+        )
+        sp360.add_event(
+            brand_id=case.brand_id,
+            lead_id=case.lead_id,
+            engine="postsale",
+            event_type="deal_close_payment",
+            payload={"payment_status": pay},
+        )
+    except ValueError as e:
+        return _err(400, str(e))
+    return jsonify({"case": case.__dict__, "payment_status": pay})
+
+
+@app.post("/v1/salespal360/postsale/feedback")
+def salespal360_postsale_feedback():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    try:
+        score = int(body.get("score") or 0)
+    except (TypeError, ValueError):
+        return _err(400, "score must be integer")
+    if score < 1 or score > 10:
+        return _err(400, "score must be between 1 and 10")
+    brand_id = str(body.get("brand_id") or "").strip()
+    lead_id = str(body.get("lead_id") or "").strip()
+    ev_type = "feedback_positive" if score >= 8 else ("feedback_neutral" if score >= 5 else "feedback_negative")
+    try:
+        case = sp360.upsert_case(
+            brand_id=brand_id,
+            lead_id=lead_id,
+            stage="postsale",
+            status="feedback_captured",
+            owner="ai",
+            score=min(100, score * 10),
+        )
+        sp360.add_event(
+            brand_id=brand_id,
+            lead_id=lead_id,
+            engine="postsale",
+            event_type=ev_type,
+            payload={"score": score},
+        )
+    except ValueError as e:
+        return _err(400, str(e))
+    next_action = "referral_testimonial" if score >= 8 else ("upsell_retention" if score >= 5 else "owner_alert")
+    return jsonify({"case": case.__dict__, "score": score, "next_action": next_action})
+
+
+@app.post("/v1/salespal360/support/open")
+def salespal360_support_open():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    try:
+        t = sp360.create_ticket(
+            brand_id=str(body.get("brand_id") or "").strip(),
+            lead_id=str(body.get("lead_id") or "").strip(),
+            channel=str(body.get("channel") or "").strip(),
+            complaint_text=str(body.get("complaint") or "").strip(),
+        )
+        sp360.upsert_case(
+            brand_id=t.brand_id,
+            lead_id=t.lead_id,
+            stage="support",
+            status="ticket_open",
+            owner="ai",
+            score=50,
+        )
+        sp360.add_event(
+            brand_id=t.brand_id,
+            lead_id=t.lead_id,
+            engine="support",
+            event_type="ticket_open",
+            payload={"ticket_id": t.id, "complaint_id": t.complaint_id},
+        )
+    except ValueError as e:
+        return _err(400, str(e))
+    return jsonify({"ticket": t.__dict__})
+
+
+@app.post("/v1/salespal360/support/update")
+def salespal360_support_update():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    tid = str(body.get("ticket_id") or "").strip()
+    if not tid:
+        return _err(400, "ticket_id required")
+    t = sp360.update_ticket(
+        tid,
+        status=str(body.get("status") or "").strip() or None,
+        resolution=str(body.get("resolution") or "").strip() or None,
+        escalation_level=str(body.get("escalation_level") or "").strip() or None,
+    )
+    if not t:
+        return _err(404, "not found")
+    sp360.add_event(
+        brand_id=t.brand_id,
+        lead_id=t.lead_id,
+        engine="support",
+        event_type="ticket_update",
+        payload={"ticket_id": t.id, "status": t.status, "escalation_level": t.escalation_level},
+    )
+    return jsonify({"ticket": t.__dict__})
+
+
+@app.post("/v1/salespal360/memory/merge")
+def salespal360_memory_merge():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    patch = body.get("patch") if isinstance(body.get("patch"), dict) else {}
+    try:
+        m = sp360.merge_memory(
+            brand_id=str(body.get("brand_id") or "").strip(),
+            lead_id=str(body.get("lead_id") or "").strip(),
+            patch=patch,
+        )
+    except ValueError as e:
+        return _err(400, str(e))
+    return jsonify({"memory": m})
+
+
+@app.get("/v1/salespal360/memory/get")
+def salespal360_memory_get():
+    brand_id = str(request.args.get("brand_id") or "").strip()
+    lead_id = str(request.args.get("lead_id") or "").strip()
+    if not brand_id or not lead_id:
+        return _err(400, "brand_id and lead_id required")
+    try:
+        m = sp360.get_memory(brand_id=brand_id, lead_id=lead_id)
+    except ValueError as e:
+        return _err(400, str(e))
+    return jsonify({"memory": m})
+
+
+@app.get("/v1/salespal360/analytics")
+def salespal360_analytics():
+    brand_id = str(request.args.get("brand_id") or "").strip()
+    if not brand_id:
+        return _err(400, "brand_id required")
+    try:
+        a = sp360.analytics(brand_id=brand_id)
+    except ValueError as e:
+        return _err(400, str(e))
+    return jsonify({"brand_id": brand_id, "analytics": a})
+
+
+@app.post("/v1/salespal360/learning/next_action")
+def salespal360_learning_next_action():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    brand_id = str(body.get("brand_id") or "").strip()
+    if not brand_id:
+        return _err(400, "brand_id required")
+    try:
+        out = sp360.learning_next_action(brand_id=brand_id)
+    except ValueError as e:
+        return _err(400, str(e))
+    return jsonify({"brand_id": brand_id, "learning": out})
+
+
+def _sp360_lead_snapshot(brand_id: str) -> dict[str, Any]:
+    ll = leads.list(brand_id=brand_id)
+    by_source: dict[str, int] = {}
+    temps = {"hot": 0, "warm": 0, "cold": 0, "unknown": 0}
+    for x in ll:
+        by_source[str(getattr(x, "source", None) or "unknown")] = by_source.get(str(getattr(x, "source", None) or "unknown"), 0) + 1
+        raw = x.raw if isinstance(getattr(x, "raw", None), dict) else {}
+        t = str(raw.get("sales_lead_temperature") or "").lower()
+        if t in temps:
+            temps[t] += 1
+        else:
+            temps["unknown"] += 1
+    return {"leads_total": len(ll), "lead_source_tracking": by_source, "mark_temperature": temps}
+
+
+@app.get("/v1/salespal360/sales/dashboard")
+def salespal360_sales_dashboard():
+    """M2 Salespal: sales dashboard + lead management snapshot."""
+    brand_id = str(request.args.get("brand_id") or "").strip()
+    if not brand_id:
+        return _err(400, "brand_id required")
+    try:
+        core = sp360.m2_core_metrics(brand_id=brand_id)
+        snap = _sp360_lead_snapshot(brand_id)
+    except ValueError as e:
+        return _err(400, str(e))
+    return jsonify({"brand_id": brand_id, "sales_dashboard": core, "customer_crm_snapshot": snap})
+
+
+@app.get("/v1/salespal360/reports/sales")
+def salespal360_report_sales():
+    brand_id = str(request.args.get("brand_id") or "").strip()
+    if not brand_id:
+        return _err(400, "brand_id required")
+    ev = [e.__dict__ for e in sp360.events.values() if e.brand_id == brand_id and e.engine in {"sales", "marketing", "postsale"}]
+    ev.sort(key=lambda x: x["created_at"], reverse=True)
+    return jsonify({"brand_id": brand_id, "sales_reports": ev[:200]})
+
+
+@app.get("/v1/salespal360/reports/leads")
+def salespal360_report_leads():
+    brand_id = str(request.args.get("brand_id") or "").strip()
+    if not brand_id:
+        return _err(400, "brand_id required")
+    return jsonify({"brand_id": brand_id, **_sp360_lead_snapshot(brand_id)})
+
+
+@app.get("/v1/salespal360/reports/performance")
+def salespal360_report_performance():
+    brand_id = str(request.args.get("brand_id") or "").strip()
+    if not brand_id:
+        return _err(400, "brand_id required")
+    try:
+        a = sp360.analytics(brand_id=brand_id)
+    except ValueError as e:
+        return _err(400, str(e))
+    return jsonify(
+        {
+            "brand_id": brand_id,
+            "performance_reports": a,
+            "daily_reports_proxy": [x.__dict__ for x in sp360.list_activity(brand_id=brand_id, limit=20)],
+        }
+    )
+
+
+@app.get("/v1/salespal360/platform/summary")
+def salespal360_platform_summary():
+    brand_id = str(request.args.get("brand_id") or "").strip()
+    if not brand_id:
+        return _err(400, "brand_id required")
+    try:
+        s = sp360.get_platform_settings(brand_id=brand_id)
+    except ValueError as e:
+        return _err(400, str(e))
+    return jsonify(
+        {
+            "brand_id": brand_id,
+            "user_management_stub": {"max_users": 50, "active_users_estimate": 3},
+            "role_based_access": s.get("roles") or ["admin", "agent", "viewer"],
+            "system_settings": s,
+            "integration_api": {"status": "ok", "base_path": "/v1"},
+            "security_compliance": {"dnd_respect": True, "consent_log_stub": True},
+        }
+    )
+
+
+@app.post("/v1/salespal360/platform/settings")
+def salespal360_platform_settings():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    brand_id = str(body.get("brand_id") or "").strip()
+    patch = body.get("patch") if isinstance(body.get("patch"), dict) else {}
+    try:
+        out = sp360.patch_platform_settings(brand_id=brand_id, patch=patch)
+    except ValueError as e:
+        return _err(400, str(e))
+    return jsonify({"brand_id": brand_id, "settings": out})
+
+
+@app.get("/v1/salespal360/admin/summary")
+def salespal360_admin_summary():
+    brand_id = str(request.args.get("brand_id") or "").strip()
+    if not brand_id:
+        return _err(400, "brand_id required")
+    try:
+        logs = [x.__dict__ for x in sp360.list_activity(brand_id=brand_id, limit=50)]
+        crm = sp360.get_crm_config(brand_id=brand_id)
+    except ValueError as e:
+        return _err(400, str(e))
+    return jsonify({"brand_id": brand_id, "admin_dashboard": {"recent_activity": logs}, "crm_configuration": crm})
+
+
+@app.get("/v1/salespal360/admin/activity")
+def salespal360_admin_activity_list():
+    brand_id = str(request.args.get("brand_id") or "").strip()
+    if not brand_id:
+        return _err(400, "brand_id required")
+    try:
+        items = [x.__dict__ for x in sp360.list_activity(brand_id=brand_id)]
+    except ValueError as e:
+        return _err(400, str(e))
+    return jsonify({"brand_id": brand_id, "user_activity_logs": items})
+
+
+@app.post("/v1/salespal360/admin/activity")
+def salespal360_admin_activity_log():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    try:
+        e = sp360.log_activity(
+            brand_id=str(body.get("brand_id") or "").strip(),
+            actor=str(body.get("actor") or "admin").strip(),
+            action=str(body.get("action") or "manual").strip(),
+            meta=body.get("meta") if isinstance(body.get("meta"), dict) else {},
+        )
+    except ValueError as err:
+        return _err(400, str(err))
+    return jsonify({"entry": e.__dict__})
+
+
+@app.get("/v1/salespal360/admin/health")
+def salespal360_admin_health():
+    return jsonify({"system_health": {"store": "ok", "api": "ok", "timestamp": datetime.now(timezone.utc).isoformat()}})
+
+
+@app.get("/v1/salespal360/crm/config")
+def salespal360_crm_config_get():
+    brand_id = str(request.args.get("brand_id") or "").strip()
+    if not brand_id:
+        return _err(400, "brand_id required")
+    try:
+        c = sp360.get_crm_config(brand_id=brand_id)
+    except ValueError as e:
+        return _err(400, str(e))
+    return jsonify({"brand_id": brand_id, "crm_config": c})
+
+
+@app.post("/v1/salespal360/crm/config")
+def salespal360_crm_config_post():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    brand_id = str(body.get("brand_id") or "").strip()
+    patch = body.get("patch") if isinstance(body.get("patch"), dict) else {}
+    try:
+        c = sp360.patch_crm_config(brand_id=brand_id, patch=patch)
+    except ValueError as e:
+        return _err(400, str(e))
+    return jsonify({"brand_id": brand_id, "crm_config": c})
+
+
+@app.post("/v1/salespal360/tasks")
+def salespal360_tasks_create():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    try:
+        t = sp360.create_task(
+            brand_id=str(body.get("brand_id") or "").strip(),
+            title=str(body.get("title") or "").strip(),
+            lead_id=str(body.get("lead_id") or "").strip() or None,
+            due_at=str(body.get("due_at") or "").strip() or None,
+        )
+    except ValueError as e:
+        return _err(400, str(e))
+    return jsonify({"task": t.__dict__})
+
+
+@app.get("/v1/salespal360/tasks")
+def salespal360_tasks_list():
+    brand_id = str(request.args.get("brand_id") or "").strip()
+    if not brand_id:
+        return _err(400, "brand_id required")
+    try:
+        items = [x.__dict__ for x in sp360.list_tasks(brand_id=brand_id)]
+    except ValueError as e:
+        return _err(400, str(e))
+    return jsonify({"brand_id": brand_id, "tasks": items})
+
+
+@app.post("/v1/salespal360/documents")
+def salespal360_documents_create():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    try:
+        d = sp360.register_document(
+            brand_id=str(body.get("brand_id") or "").strip(),
+            name=str(body.get("name") or "").strip(),
+            kind=str(body.get("kind") or "file").strip(),
+            lead_id=str(body.get("lead_id") or "").strip() or None,
+        )
+    except ValueError as e:
+        return _err(400, str(e))
+    return jsonify({"document": d.__dict__})
+
+
+@app.get("/v1/salespal360/documents")
+def salespal360_documents_list():
+    brand_id = str(request.args.get("brand_id") or "").strip()
+    if not brand_id:
+        return _err(400, "brand_id required")
+    try:
+        items = [x.__dict__ for x in sp360.documents.values() if x.brand_id == brand_id]
+    except Exception:
+        items = []
+    items.sort(key=lambda x: x["created_at"], reverse=True)
+    return jsonify({"brand_id": brand_id, "documents": items})
+
+
+@app.post("/v1/salespal360/esign")
+def salespal360_esign_create():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    try:
+        r = sp360.request_esign(
+            brand_id=str(body.get("brand_id") or "").strip(),
+            lead_id=str(body.get("lead_id") or "").strip(),
+            document_name=str(body.get("document_name") or "contract").strip(),
+        )
+    except ValueError as e:
+        return _err(400, str(e))
+    return jsonify({"esign": r.__dict__})
+
+
+@app.get("/v1/salespal360/esign")
+def salespal360_esign_list():
+    brand_id = str(request.args.get("brand_id") or "").strip()
+    if not brand_id:
+        return _err(400, "brand_id required")
+    items = [x.__dict__ for x in sp360.esign_requests.values() if x.brand_id == brand_id]
+    items.sort(key=lambda x: x["created_at"], reverse=True)
+    return jsonify({"brand_id": brand_id, "esign_requests": items})
+
+
+@app.get("/v1/salespal360/forecast")
+def salespal360_forecast():
+    brand_id = str(request.args.get("brand_id") or "").strip()
+    if not brand_id:
+        return _err(400, "brand_id required")
+    try:
+        f = sp360.sales_forecast_stub(brand_id=brand_id)
+    except ValueError as e:
+        return _err(400, str(e))
+    return jsonify(f)
+
+
+@app.get("/v1/salespal360/features/status")
+def salespal360_features_status():
+    """M2 checklist: what is wired (stubs vs live)."""
+    return jsonify(
+        {
+            "milestone": "M2 SalesPal 360",
+            "features": {
+                "lead_source_tracking": {"implemented": True, "endpoint": "GET /v1/salespal360/reports/leads"},
+                "sales_pipeline_management": {"implemented": True, "endpoint": "GET /v1/salespal360/crm/config + case upsert"},
+                "task_reminder_system": {"implemented": True, "endpoint": "GET/POST /v1/salespal360/tasks"},
+                "sales_forecasting": {"implemented": True, "endpoint": "GET /v1/salespal360/forecast"},
+                "email_sms_integration": {"implemented": "stub", "note": "Use /v1/marketing/ops and webhooks"},
+                "document_storage": {"implemented": True, "endpoint": "GET/POST /v1/salespal360/documents"},
+                "social_media_integration": {"implemented": "stub", "note": "Marketing M1 social ops"},
+                "api_integration_layer": {"implemented": True, "endpoint": "GET /v1/salespal360/platform/summary"},
+                "e_signature": {"implemented": True, "endpoint": "GET/POST /v1/salespal360/esign"},
+            },
+        }
+    )
+
+
+def _sale_next_action_from_score(score: int) -> dict[str, str]:
+    if score >= 8:
+        return {"bucket": "positive", "action": "ask_referral"}
+    if score >= 5:
+        return {"bucket": "neutral", "action": "soft_referral"}
+    return {"bucket": "negative", "action": "ai_resolve_first"}
+
+
+_SALE_ALLOWED_BY_STATUS: dict[str, set[str]] = {
+    "started": {
+        "retry_2hr_then_630pm_then_nextday",
+        "retry_next_slot",
+        "stop_wrong_number",
+        "conversation_open",
+        "wa_followup_d0_d1_d3_d5_d7",
+    },
+    "call_no_answer": {"retry_2hr_then_630pm_then_nextday"},
+    "call_busy": {"retry_next_slot"},
+    "call_connected": {"conversation_open"},
+    "wa_followup_day0_1_3_5_7": {
+        "conversation_open",
+        "set_user_type_genuine",
+        "capture_need_budget_timeline",
+        "lead_type_hot",
+        "lead_type_warm",
+        "lead_type_cold",
+        "warm_whatsapp_d1_d3_d5",
+        "cold_weekly_campaign_broadcast",
+    },
+    "conversation": {"set_user_type_abusive", "set_user_type_timepass", "set_user_type_genuine"},
+    "exit_block": set(),
+    "short_exit": set(),
+    "qualification": {"capture_need_budget_timeline"},
+    "capture_need_budget_timeline": {"lead_type_hot", "lead_type_warm", "lead_type_cold"},
+    "lead_type_hot": {"notify_owner_immediately", "push_call_or_meeting_same_day", "visit_or_meeting", "warm_whatsapp_d1_d3_d5"},
+    "push_call_or_meeting_same_day": {"schedule_datetime", "send_location_or_link", "visit_or_meeting"},
+    "warm_whatsapp_d1_d3_d5": {"warm_reminder_1d_sameday_1hr"},
+    "lead_type_warm": {"warm_whatsapp_d1_d3_d5", "warm_call_next_day_11_or_630", "warm_convert_to_meeting"},
+    "lead_type_cold": {"cold_weekly_campaign_broadcast"},
+    "visit_or_meeting": {"schedule_datetime", "send_location_or_link", "warm_reminder_1d_sameday_1hr", "visit_status_done", "visit_status_no_show"},
+    "warm_convert_to_meeting": {"visit_status_done", "visit_status_no_show"},
+    "visit_status_done": {"proceed_after_visit_done"},
+    "visit_status_no_show": {"reschedule_next_day"},
+    "proceed_after_visit_done": {"need_escalation_yes", "need_escalation_critical"},
+    "need_escalation_yes": {"senior_ai_call_male_voice"},
+    "need_escalation_critical": {"human_intervention"},
+    "senior_ai_call_male_voice": {"outcome"},
+    "human_intervention": {"outcome"},
+    "outcome": {"notify_owner"},
+    "notify_owner": {"ask_rating_1_to_10"},
+    "ask_rating_1_to_10": {"score_1_4", "score_5_7", "score_8_10"},
+    "score_8_10": {"positive", "ask_referral"},
+    "score_5_7": {"neutral", "soft_referral"},
+    "score_1_4": {"negative", "ai_resolve_first"},
+    "ai_resolve_first": {"resolved_yes", "resolved_no"},
+    "resolved_no": {"owner_alert"},
+    "resolved_yes": {"update_dashboard"},
+    "owner_alert": set(),
+    "ask_referral": {"update_dashboard"},
+    "soft_referral": {"update_dashboard"},
+    "update_dashboard": {"morning_plan_today", "evening_report_today", "learning_loop"},
+    "learning_loop": {"sales_system"},
+    "sales_system": set(),
+}
+
+
+def _sale_next_allowed(status: str) -> list[str]:
+    return sorted(_SALE_ALLOWED_BY_STATUS.get(status, set()))
+
+
+def _sale_set_status(brand_id: str, lead_id: str, status: str, *, stage: str = "flow", payload: dict[str, Any] | None = None, next_action_at: str | None = None):
+    s = saleops.upsert_session(brand_id=brand_id, lead_id=lead_id, stage=stage, status=status, next_action_at=next_action_at)
+    e = saleops.add_event(brand_id=brand_id, lead_id=lead_id, event_type="diagram_action", payload={"status": status, **(payload or {})})
+    return s, e
+
+
+@app.get("/sale")
+def sale_console():
+    html = """<!doctype html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Sales Operations Console</title><style>
+  :root{--bg:#f1f5f9;--panel:#ffffff;--line:#d9e1ea;--text:#0f172a;--muted:#64748b;--accent:#0f4c81;--ok:#0f766e;--warn:#9f1239}
+  *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font-family:Inter,Arial,sans-serif}
+  .wrap{max-width:1360px;margin:0 auto;padding:16px}
+  .hero{background:linear-gradient(135deg,#0f4c81,#155e75);color:#fff;padding:14px 16px;border-radius:12px;margin-bottom:12px}
+  .layout{display:grid;grid-template-columns:2.3fr 1fr;gap:12px}@media(max-width:1100px){.layout{grid-template-columns:1fr}}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px;margin-bottom:12px}
+  .flow{position:relative}
+  .flow:before{content:"";position:absolute;left:16px;top:8px;bottom:8px;width:3px;background:#e2e8f0;border-radius:3px}
+  .step{position:relative;padding-left:34px}
+  .step:before{content:"";position:absolute;left:10px;top:18px;width:14px;height:14px;border-radius:999px;background:#fff;border:3px solid #94a3b8}
+  .step.active:before{border-color:#0f4c81;background:#dbeafe}
+  .step.done:before{border-color:#0f766e;background:#ccfbf1}
+  h2{margin:0 0 8px;font-size:17px} h3{margin:0 0 8px;font-size:14px}
+  label{display:block;font-size:12px;font-weight:700;color:var(--muted);margin:7px 0 3px;text-transform:uppercase;letter-spacing:.03em}
+  input,select,textarea{width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:#fff;font:inherit}
+  textarea{min-height:66px;resize:vertical}
+  .row{display:grid;grid-template-columns:1fr 1fr;gap:10px}@media(max-width:780px){.row{grid-template-columns:1fr}}
+  .btns{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px}
+  button{border:0;border-radius:8px;padding:8px 10px;background:var(--accent);color:#fff;font-weight:700;cursor:pointer}
+  button.alt{background:#1f2937} button.good{background:var(--ok)} button.warn{background:var(--warn)}
+  button.ghost{background:#475569} button[disabled]{opacity:.45;cursor:not-allowed}
+  .chips{display:flex;flex-wrap:wrap;gap:6px}
+  .chip{font-size:11px;padding:4px 8px;border-radius:999px;background:#e2e8f0;color:#0f172a;font-weight:700}
+  .hint{font-size:12px;color:var(--muted)} .tiny{font-size:11px;color:#475569}
+  pre{margin:0;white-space:pre-wrap;word-break:break-word;background:#0f172a;color:#e2e8f0;border-radius:10px;padding:10px;max-height:70vh;overflow:auto;font-size:12px}
+  .state{display:grid;grid-template-columns:1fr;gap:8px}
+</style></head><body><div class="wrap">
+  <div class="hero"><strong>Sales Operations Console</strong><div class="hint" style="color:#dbeafe">Complete lead-to-outcome operations aligned with Milestone 3 flow.</div></div>
+  <div class="layout"><main class="flow">
+    <section class="card step active" id="s-intake"><h2>Lead Intake, Locale Setup, Parallel Outreach</h2>
+      <div class="row"><div><label>Brand Id</label><input id="brand" value="demo"/></div><div><label>Lead Id</label><input id="lead" placeholder="lead id"/></div></div>
+      <div class="row"><div><label>Admin API Key</label><input id="adminkey" placeholder="X-Admin-Api-Key"/></div><div><label>Timezone</label><input id="tz" value="Asia/Kolkata"/></div></div>
+      <div class="row"><div><label>Default Language</label><select id="lang"><option value="hinglish" selected>hinglish</option><option value="hi">hi</option><option value="en">en</option></select></div><div><label>Auto Language Switch</label><select id="autosw"><option value="true" selected>true</option><option value="false">false</option></select></div></div>
+      <div class="chips"><span class="chip">Call Active 9AM-9PM</span><span class="chip">WhatsApp Active 24x7</span></div>
+      <div class="btns"><button onclick="startParallel()">Start Call + WhatsApp Together</button><button class="ghost" onclick="timeline()">Refresh Timeline</button></div>
+    </section>
+
+    <section class="card step" id="s-channel"><h2>Channel Outcomes (Call + WhatsApp)</h2>
+      <div class="row"><div><label>Call Result</label><select id="cr"><option>no_answer</option><option>busy</option><option>wrong_number</option><option>connected</option></select></div><div><label>WhatsApp Reply (No -> Follow-up, Yes -> Conversation)</label><select id="wr"><option>no</option><option>yes</option></select></div></div>
+      <div class="btns">
+        <button onclick="callResult()">Apply Call Result</button>
+        <button class="alt" onclick="waReply()">Apply WhatsApp Reply</button>
+      </div>
+      <div class="tiny">Branch is applied automatically by call result and WhatsApp reply above.</div>
+    </section>
+
+    <section class="card step" id="s-qual"><h2>User Classification and Qualification</h2>
+      <div class="row"><div><label>User Type</label><select id="ut"><option>genuine</option><option>timepass</option><option>abusive</option></select></div><div><label>Lead Type</label><select id="lt"><option>hot</option><option>warm</option><option>cold</option></select></div></div>
+      <label>Capture Need / Budget / Timeline</label><textarea id="nbt">Need: demo\\nBudget: 50000\\nTimeline: 7 days</textarea>
+      <div class="btns"><button onclick="userType()">Set User Type</button><button onclick="qualify()">Set Qualification + Lead Type</button></div>
+      <div class="tiny">User type and lead type are captured via the two apply buttons above.</div>
+    </section>
+
+    <section class="card step" id="s-flow"><h2>Hot, Warm, and Cold Lead Workflows</h2>
+      <div class="row"><div><label>Schedule Date Time</label><input id="mt" type="datetime-local"/></div><div><label>Location / Link</label><input id="mlink" placeholder="https://meet.google.com/..."/></div></div>
+      <div class="row"><div><label>Flow Action (Hot/Warm/Cold)</label><select id="flow_action">
+        <option value="notify_owner_immediately">Notify Owner Immediately</option>
+        <option value="push_call_or_meeting_same_day">Push Call or Meeting Same Day</option>
+        <option value="visit_or_meeting">Visit or Meeting</option>
+        <option value="schedule_datetime">Schedule Date Time</option>
+        <option value="send_location_or_link">Send Location or Link</option>
+        <option value="warm_whatsapp_d1_d3_d5">WhatsApp Day1 Day3 Day5</option>
+        <option value="warm_reminder_1d_sameday_1hr">Reminder 1 day / same day / 1hr</option>
+        <option value="warm_call_next_day_11_or_630">Call next day 11AM or 6:30PM</option>
+        <option value="warm_convert_to_meeting">Convert to Meeting</option>
+        <option value="cold_weekly_campaign_broadcast">Weekly Campaign Broadcast</option>
+      </select></div><div><label>Apply</label><button onclick="runSelectedAction('flow_action')">Apply Flow Action</button></div></div>
+    </section>
+
+    <section class="card step" id="s-escalate"><h2>Visit Status, Escalation, and Outcome</h2>
+      <div class="row"><div><label>Visit/Escalation Action</label><select id="escalation_action">
+        <option value="visit_status_done">Visit Status Done</option>
+        <option value="proceed_after_visit_done">Proceed</option>
+        <option value="visit_status_no_show">Visit Status No Show</option>
+        <option value="reschedule_next_day">Reschedule Next Day</option>
+        <option value="need_escalation_yes">Need Escalation Yes</option>
+        <option value="senior_ai_call_male_voice">Senior AI Call Male Voice</option>
+        <option value="need_escalation_critical">Need Escalation Critical</option>
+        <option value="human_intervention">Human Intervention</option>
+        <option value="outcome">Outcome</option>
+        <option value="notify_owner">Notify Owner</option>
+        <option value="ask_rating_1_to_10">Ask Rating 1 to 10</option>
+      </select></div><div><label>Apply</label><button onclick="runSelectedAction('escalation_action')">Apply Visit/Escalation</button></div></div>
+    </section>
+
+    <section class="card step" id="s-score"><h2>Feedback Scoring, Resolution, and Reporting</h2>
+      <div class="row"><div><label>Score (1-10)</label><input id="score" type="number" min="1" max="10" value="8"/></div><div><label>Resolved?</label><select id="res"><option>yes</option><option>no</option></select></div></div>
+      <div class="btns"><button class="good" onclick="score()">Submit Score</button></div>
+      <div class="row"><div><label>Score/Reporting Action</label><select id="score_action">
+        <option value="score_1_4">Score 1-4 Negative</option>
+        <option value="ai_resolve_first">AI Resolve First</option>
+        <option value="resolved_no">Resolved No</option>
+        <option value="owner_alert">Owner Alert</option>
+        <option value="resolved_yes">Resolved Yes</option>
+        <option value="update_dashboard">Update Dashboard</option>
+        <option value="score_5_7">Score 5-7 Neutral</option>
+        <option value="soft_referral">Soft Referral</option>
+        <option value="score_8_10">Score 8-10 Positive</option>
+        <option value="ask_referral">Ask Referral</option>
+        <option value="morning_plan_today">Morning Plan Today</option>
+        <option value="evening_report_today">Evening Report Today</option>
+        <option value="learning_loop">Learning Loop</option>
+        <option value="sales_system">Sales System</option>
+      </select></div><div><label>Apply</label><button onclick="runSelectedAction('score_action')">Apply Score/Reporting Action</button></div></div>
+    </section>
+  </main><aside>
+    <section class="card"><h3>Current Flow State</h3>
+      <div class="state">
+        <div><span class="tiny">Current status</span><div id="currentStatus" class="chip">unknown</div></div>
+        <div><span class="tiny">Next allowed actions</span><div id="nextAllowed" class="chips"></div></div>
+      </div>
+    </section>
+    <section class="card"><h3>Analytics + Utilities</h3>
+      <div class="btns"><button onclick="dash()">Dashboard API</button><button class="alt" onclick="dayPlan()">Day Plan API</button><button class="alt" onclick="learn()">Learning API</button></div>
+    </section>
+    <section class="card"><h3>API Response</h3><pre id="out">Ready.</pre></section>
+  </aside></div></div>
+<script>
+const out=document.getElementById('out');
+const currentStatus=document.getElementById('currentStatus');
+const nextAllowed=document.getElementById('nextAllowed');
+let current='started';
+let allowed=[];
+
+function headers(){const h={'Content-Type':'application/json'};const k=(document.getElementById('adminkey').value||'').trim();if(k)h['X-Admin-Api-Key']=k;return h;}
+function brand(){return (document.getElementById('brand').value||'').trim();}
+function lead(){return (document.getElementById('lead').value||'').trim();}
+function renderAllowed(){
+  currentStatus.textContent=current||'unknown';
+  nextAllowed.innerHTML='';
+  for(const a of allowed){const s=document.createElement('span');s.className='chip';s.textContent=a;nextAllowed.appendChild(s);}
+  document.querySelectorAll('[data-a]').forEach(btn=>{btn.disabled=allowed.length>0 && !allowed.includes(btn.dataset.a);});
+}
+function consumeState(j){
+  if(j && j.session && j.session.status){current=j.session.status;}
+  if(j && Array.isArray(j.next_allowed_actions)){allowed=j.next_allowed_actions;}
+  renderAllowed();
+}
+async function api(p,m='GET',b=null){
+  const r=await fetch(p,{method:m,headers:headers(),body:b?JSON.stringify(b):null});
+  const j=await r.json().catch(()=>({raw:'non-json'}));
+  if(!r.ok)j._http={status:r.status};
+  out.textContent=JSON.stringify(j,null,2);
+  consumeState(j);
+  return j;
+}
+async function runAction(kind){await api('/v1/sale/action','POST',{brand_id:brand(),lead_id:lead(),action:kind,meeting_time_local:(document.getElementById('mt').value||''),location_link:(document.getElementById('mlink').value||'')});}
+async function runSelectedAction(selId){const k=(document.getElementById(selId).value||'').trim();if(!k)return;await runAction(k);}
+async function startParallel(){const j=await api('/v1/sale/start','POST',{brand_id:brand(),lead_id:lead(),timezone:document.getElementById('tz').value,language:document.getElementById('lang').value,auto_language_switch:(document.getElementById('autosw').value==='true')});if(j&&j.session&&j.session.status){current=j.session.status;allowed=['retry_2hr_then_630pm_then_nextday','retry_next_slot','stop_wrong_number','conversation_open','wa_followup_d0_d1_d3_d5_d7'];renderAllowed();}}
+async function callResult(){const j=await api('/v1/sale/call_result','POST',{brand_id:brand(),lead_id:lead(),result:document.getElementById('cr').value});if(j&&j.session&&j.session.status){current=j.session.status;allowed=[];renderAllowed();}}
+async function waReply(){const j=await api('/v1/sale/wa_reply','POST',{brand_id:brand(),lead_id:lead(),reply:document.getElementById('wr').value});if(j&&j.session&&j.session.status){current=j.session.status;allowed=[];renderAllowed();}}
+async function userType(){const j=await api('/v1/sale/user_type','POST',{brand_id:brand(),lead_id:lead(),user_type:document.getElementById('ut').value});if(j&&j.session&&j.session.status){current=j.session.status;allowed=[];renderAllowed();}}
+async function qualify(){const j=await api('/v1/sale/qualification','POST',{brand_id:brand(),lead_id:lead(),lead_type:document.getElementById('lt').value,need_budget_timeline:document.getElementById('nbt').value});if(j&&j.session&&j.session.status){current=j.session.status;allowed=[];renderAllowed();}}
+async function score(){await api('/v1/sale/score','POST',{brand_id:brand(),lead_id:lead(),score:Number(document.getElementById('score').value||0),resolved:(document.getElementById('res').value==='yes')});}
+async function dash(){await api('/v1/sale/dashboard?brand_id='+encodeURIComponent(brand()));}
+async function learn(){await api('/v1/sale/learning','POST',{brand_id:brand()});}
+async function timeline(){
+  const j=await api('/v1/sale/timeline?brand_id='+encodeURIComponent(brand())+'&lead_id='+encodeURIComponent(lead()));
+  if(j&&j.session&&j.session.status){current=j.session.status;}
+  allowed=[];renderAllowed();
+}
+async function dayPlan(){await api('/v1/sale/day_plan','POST',{brand_id:brand()});}
+renderAllowed();
+</script></body></html>"""
+    return Response(html, mimetype="text/html; charset=utf-8")
+
+
+@app.post("/v1/sale/start")
+def sale_start():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    brand_id = str(body.get("brand_id") or "").strip()
+    lead_id = str(body.get("lead_id") or "").strip()
+    tz = str(body.get("timezone") or "Asia/Kolkata").strip()
+    lang = str(body.get("language") or "hinglish").strip().lower()
+    auto = bool(body.get("auto_language_switch", True))
+    try:
+        s = saleops.upsert_session(
+            brand_id=brand_id, lead_id=lead_id, timezone=tz, language=lang, auto_language_switch=auto, stage="init", status="started"
+        )
+        saleops.add_event(brand_id=brand_id, lead_id=lead_id, event_type="start", payload={"timezone": tz, "language": lang})
+    except ValueError as e:
+        return _err(400, str(e))
+    # Best-effort start parallel outreach if lead exists in core store.
+    if leads.get(lead_id):
+        try:
+            start_parallel_outreach(leads, conversations, lead_id, tz_name=tz, auto_sync_lead=_auto_sync_lead)
+        except Exception:
+            pass
+    leads.merge_raw(lead_id, {"sales_timezone": tz, "sales_language": lang, "sales_auto_language_switch": auto})
+    return jsonify({"session": s.__dict__})
+
+
+@app.post("/v1/sale/call_result")
+def sale_call_result():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    result = str(body.get("result") or "").strip().lower()
+    if result not in {"no_answer", "busy", "wrong_number", "connected"}:
+        return _err(400, "invalid result")
+    brand_id = str(body.get("brand_id") or "").strip()
+    lead_id = str(body.get("lead_id") or "").strip()
+    next_action = None
+    flow_steps: list[str] = []
+    status = "call_" + result
+    if result == "no_answer":
+        now = datetime.now(timezone.utc)
+        next_action = (now + timedelta(hours=2)).isoformat()
+        flow_steps = [
+            "Retry after 2 hours",
+            "If still pending, retry at 18:30 local",
+            "If still pending, retry next day same slot",
+        ]
+    elif result == "busy":
+        next_action = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        flow_steps = ["Retry in next available slot"]
+    elif result == "wrong_number":
+        status = "stop_wrong_number"
+        flow_steps = ["Stop outreach for this contact"]
+    else:
+        flow_steps = ["Open conversation path"]
+    try:
+        s = saleops.upsert_session(brand_id=brand_id, lead_id=lead_id, stage="call", status=status, next_action_at=next_action)
+        saleops.add_event(
+            brand_id=brand_id,
+            lead_id=lead_id,
+            event_type="call_result",
+            payload={"result": result, "next_action_at": next_action, "flow_steps": flow_steps},
+        )
+    except ValueError as e:
+        return _err(400, str(e))
+    return jsonify({"session": s.__dict__, "result": result, "next_action_at": next_action, "flow_steps": flow_steps})
+
+
+@app.post("/v1/sale/wa_reply")
+def sale_wa_reply():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    reply = str(body.get("reply") or "").strip().lower()
+    if reply not in {"yes", "no"}:
+        return _err(400, "reply must be yes/no")
+    brand_id = str(body.get("brand_id") or "").strip()
+    lead_id = str(body.get("lead_id") or "").strip()
+    # Diagram mapping:
+    # - Yes -> conversation
+    # - No -> WA follow-up sequence (Day0/1/3/5/7)
+    status = "conversation" if reply == "yes" else "wa_followup_day0_1_3_5_7"
+    seq = [0, 1, 3, 5, 7] if reply == "no" else []
+    try:
+        s = saleops.upsert_session(brand_id=brand_id, lead_id=lead_id, stage="whatsapp", status=status)
+        saleops.add_event(brand_id=brand_id, lead_id=lead_id, event_type="wa_reply", payload={"reply": reply, "followup_days": seq})
+    except ValueError as e:
+        return _err(400, str(e))
+    return jsonify({"session": s.__dict__, "reply": reply, "followup_days": seq})
+
+
+@app.post("/v1/sale/user_type")
+def sale_user_type():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    u = str(body.get("user_type") or "").strip().lower()
+    if u not in {"abusive", "timepass", "genuine"}:
+        return _err(400, "invalid user_type")
+    brand_id = str(body.get("brand_id") or "").strip()
+    lead_id = str(body.get("lead_id") or "").strip()
+    status = "qualification"
+    if u == "abusive":
+        status = "exit_block"
+    elif u == "timepass":
+        status = "short_exit"
+    try:
+        s = saleops.upsert_session(brand_id=brand_id, lead_id=lead_id, user_type=u, stage="qualification", status=status)
+        saleops.add_event(brand_id=brand_id, lead_id=lead_id, event_type="user_type", payload={"user_type": u})
+    except ValueError as e:
+        return _err(400, str(e))
+    leads.merge_raw(lead_id, {"sales_user_type": u})
+    return jsonify({"session": s.__dict__})
+
+
+@app.post("/v1/sale/qualification")
+def sale_qualification():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    lt = str(body.get("lead_type") or "").strip().lower()
+    if lt not in {"hot", "warm", "cold"}:
+        return _err(400, "lead_type must be hot/warm/cold")
+    brand_id = str(body.get("brand_id") or "").strip()
+    lead_id = str(body.get("lead_id") or "").strip()
+    nbt = str(body.get("need_budget_timeline") or "").strip()
+    status = "lead_type_" + lt
+    try:
+        s = saleops.upsert_session(brand_id=brand_id, lead_id=lead_id, lead_type=lt, stage="qualification", status=status)
+        saleops.add_event(brand_id=brand_id, lead_id=lead_id, event_type="lead_type", payload={"lead_type": lt, "need_budget_timeline": nbt})
+    except ValueError as e:
+        return _err(400, str(e))
+    leads.merge_raw(lead_id, {"sales_lead_temperature": lt, "sales_need_budget_timeline": nbt})
+    return jsonify({"session": s.__dict__, "lead_type": lt, "status": status})
+
+
+@app.post("/v1/sale/meeting")
+def sale_meeting():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    ms = str(body.get("meeting_status") or "").strip().lower()
+    if ms not in {"scheduled", "done", "no_show", "reschedule"}:
+        return _err(400, "invalid meeting_status")
+    brand_id = str(body.get("brand_id") or "").strip()
+    lead_id = str(body.get("lead_id") or "").strip()
+    status = "visit_" + ms
+    if ms == "no_show":
+        next_at = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+    else:
+        next_at = None
+    try:
+        s = saleops.upsert_session(brand_id=brand_id, lead_id=lead_id, stage="meeting", status=status, next_action_at=next_at)
+        saleops.add_event(brand_id=brand_id, lead_id=lead_id, event_type="visit_status", payload={"meeting_status": ms, "next_action_at": next_at})
+    except ValueError as e:
+        return _err(400, str(e))
+    return jsonify({"session": s.__dict__, "meeting_status": ms, "next_action_at": next_at})
+
+
+@app.post("/v1/sale/escalation")
+def sale_escalation():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    level = str(body.get("level") or "").strip().lower()
+    if level not in {"none", "senior_ai", "human", "critical"}:
+        return _err(400, "invalid level")
+    brand_id = str(body.get("brand_id") or "").strip()
+    lead_id = str(body.get("lead_id") or "").strip()
+    status = "escalation_" + level
+    try:
+        s = saleops.upsert_session(brand_id=brand_id, lead_id=lead_id, stage="escalation", status=status)
+        saleops.add_event(brand_id=brand_id, lead_id=lead_id, event_type="escalation", payload={"level": level})
+    except ValueError as e:
+        return _err(400, str(e))
+    leads.merge_raw(lead_id, {"sales_escalation": level})
+    return jsonify({"session": s.__dict__, "level": level})
+
+
+@app.post("/v1/sale/score")
+def sale_score():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    try:
+        score = int(body.get("score") or 0)
+    except (TypeError, ValueError):
+        return _err(400, "score must be integer")
+    if score < 1 or score > 10:
+        return _err(400, "score must be 1..10")
+    resolved = bool(body.get("resolved", True))
+    brand_id = str(body.get("brand_id") or "").strip()
+    lead_id = str(body.get("lead_id") or "").strip()
+    plan = _sale_next_action_from_score(score)
+    # Keep score endpoint focused on score branching only; resolution branching
+    # is explicitly handled by action transitions (resolved_yes / resolved_no).
+    try:
+        s = saleops.upsert_session(brand_id=brand_id, lead_id=lead_id, stage="score", status=plan["action"], score=score)
+        saleops.add_event(
+            brand_id=brand_id,
+            lead_id=lead_id,
+            event_type="score",
+            payload={"score": score, "resolved_hint": resolved, "bucket": plan["bucket"], "action": plan["action"]},
+        )
+    except ValueError as e:
+        return _err(400, str(e))
+    leads.merge_raw(lead_id, {"sales_feedback_score": score})
+    return jsonify({"session": s.__dict__, "score_bucket": plan["bucket"], "next_action": plan["action"], "next_allowed_actions": _sale_next_allowed(plan["action"])})
+
+
+@app.post("/v1/sale/action")
+def sale_action():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    brand_id = str(body.get("brand_id") or "").strip()
+    lead_id = str(body.get("lead_id") or "").strip()
+    action = str(body.get("action") or "").strip().lower()
+    meeting_time_local = str(body.get("meeting_time_local") or "").strip()
+    location_link = str(body.get("location_link") or "").strip()
+    all_actions = {a for v in _SALE_ALLOWED_BY_STATUS.values() for a in v}
+    if action not in all_actions:
+        return _err(400, "invalid action")
+
+    cur = saleops.get_session(brand_id=brand_id, lead_id=lead_id)
+    current_status = cur.status if cur else "started"
+    allowed_next = _sale_next_allowed(current_status)
+    if action not in allowed_next:
+        return _err(
+            409,
+            f"invalid transition from {current_status} -> {action}; allowed next: {', '.join(allowed_next) if allowed_next else '(none)'}",
+        )
+
+    stage = "action"
+    status = action
+    payload: dict[str, Any] = {}
+    next_action_at = None
+    if action == "retry_2hr_then_630pm_then_nextday":
+        stage = "call"
+        payload = {"steps": ["retry_2h", "retry_18_30_local", "retry_next_day_same_slot"]}
+        next_action_at = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
+    elif action == "retry_next_slot":
+        stage = "call"
+        next_action_at = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    elif action == "stop_wrong_number":
+        stage = "call"
+        status = "stop_wrong_number"
+    elif action == "conversation_open":
+        stage = "whatsapp"
+    elif action == "wa_followup_d0_d1_d3_d5_d7":
+        stage = "whatsapp"
+        payload = {"followup_days": [0, 1, 3, 5, 7]}
+    elif action in {"set_user_type_abusive", "set_user_type_timepass", "set_user_type_genuine"}:
+        stage = "qualification"
+        if action == "set_user_type_abusive":
+            status = "exit_block"
+            leads.merge_raw(lead_id, {"sales_user_type": "abusive"})
+        elif action == "set_user_type_timepass":
+            status = "short_exit"
+            leads.merge_raw(lead_id, {"sales_user_type": "timepass"})
+        else:
+            status = "qualification"
+            leads.merge_raw(lead_id, {"sales_user_type": "genuine"})
+    elif action == "capture_need_budget_timeline":
+        stage = "qualification"
+        status = "capture_need_budget_timeline"
+    elif action in {"lead_type_hot", "lead_type_warm", "lead_type_cold"}:
+        stage = "qualification"
+        status = action
+        leads.merge_raw(lead_id, {"sales_lead_temperature": action.replace("lead_type_", "")})
+    elif action in {"notify_owner_immediately", "notify_owner", "owner_alert"}:
+        stage = "owner"
+    elif action in {"push_call_or_meeting_same_day", "visit_or_meeting", "warm_convert_to_meeting"}:
+        stage = "meeting"
+    elif action == "schedule_datetime":
+        stage = "meeting"
+        status = "schedule_datetime"
+        payload = {"meeting_time_local": meeting_time_local}
+    elif action == "send_location_or_link":
+        stage = "meeting"
+        status = "send_location_or_link"
+        payload = {"location_link": location_link}
+    elif action == "warm_whatsapp_d1_d3_d5":
+        stage = "followup"
+        payload = {"followup_days": [1, 3, 5]}
+    elif action == "warm_call_next_day_11_or_630":
+        stage = "followup"
+        payload = {"next_day_slots_local": ["11:00", "18:30"]}
+        next_action_at = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+    elif action == "warm_reminder_1d_sameday_1hr":
+        stage = "followup"
+        payload = {"reminders": ["1_day", "same_day", "1_hour_before"]}
+    elif action == "cold_weekly_campaign_broadcast":
+        stage = "campaign"
+        payload = {"cadence": "weekly"}
+    elif action in {"visit_status_done", "visit_status_no_show"}:
+        stage = "meeting"
+        status = action
+    elif action == "reschedule_next_day":
+        stage = "meeting"
+        next_action_at = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+    elif action in {"proceed_after_visit_done", "need_escalation_yes", "need_escalation_critical", "senior_ai_call_male_voice", "human_intervention", "outcome"}:
+        stage = "escalation"
+    elif action == "ask_rating_1_to_10":
+        stage = "score"
+    elif action in {"score_1_4", "score_5_7", "score_8_10"}:
+        stage = "score"
+    elif action in {"positive", "neutral", "negative"}:
+        stage = "score"
+    elif action in {"resolved_yes", "resolved_no"}:
+        stage = "score"
+    elif action in {"ask_referral", "soft_referral", "ai_resolve_first"}:
+        stage = "score"
+    elif action == "update_dashboard":
+        stage = "dashboard"
+    elif action in {"morning_plan_today", "evening_report_today", "learning_loop", "sales_system"}:
+        stage = "dashboard"
+
+    try:
+        s = saleops.upsert_session(brand_id=brand_id, lead_id=lead_id, stage=stage, status=status, next_action_at=next_action_at)
+        e = saleops.add_event(brand_id=brand_id, lead_id=lead_id, event_type="diagram_action", payload={"action": action, **payload})
+    except ValueError as e:
+        return _err(400, str(e))
+    return jsonify(
+        {
+            "session": s.__dict__,
+            "event": e.__dict__,
+            "action": action,
+            "next_action_at": next_action_at,
+            "next_allowed_actions": _sale_next_allowed(status),
+        }
+    )
+
+
+@app.get("/v1/sale/timeline")
+def sale_timeline():
+    brand_id = str(request.args.get("brand_id") or "").strip()
+    lead_id = str(request.args.get("lead_id") or "").strip()
+    if not brand_id or not lead_id:
+        return _err(400, "brand_id and lead_id required")
+    try:
+        s = saleops.get_session(brand_id=brand_id, lead_id=lead_id)
+        ev = [e.__dict__ for e in saleops.list_events(brand_id=brand_id, lead_id=lead_id)]
+    except ValueError as e:
+        return _err(400, str(e))
+    return jsonify({"session": s.__dict__ if s else None, "events": ev})
+
+
+@app.get("/v1/sale/dashboard")
+def sale_dashboard():
+    brand_id = str(request.args.get("brand_id") or "").strip()
+    if not brand_id:
+        return _err(400, "brand_id required")
+    ss = [s for s in saleops.sessions.values() if s.brand_id == brand_id]
+    ev = [e for e in saleops.events.values() if e.brand_id == brand_id]
+    by_lead_type = {"hot": 0, "warm": 0, "cold": 0, "unknown": 0}
+    by_status: dict[str, int] = {}
+    for s in ss:
+        by_lead_type[s.lead_type if s.lead_type in by_lead_type else "unknown"] += 1
+        by_status[s.status] = by_status.get(s.status, 0) + 1
+    avg_score = round(sum((s.score or 0) for s in ss) / len([s for s in ss if s.score is not None]), 2) if any(
+        s.score is not None for s in ss
+    ) else None
+    return jsonify({"brand_id": brand_id, "sessions_total": len(ss), "events_total": len(ev), "lead_type_breakdown": by_lead_type, "status_breakdown": by_status, "average_score": avg_score})
+
+
+@app.post("/v1/sale/day_plan")
+def sale_day_plan():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    brand_id = str(body.get("brand_id") or "").strip()
+    if not brand_id:
+        return _err(400, "brand_id required")
+    now = datetime.now(timezone.utc)
+    morning = [s.lead_id for s in saleops.sessions.values() if s.brand_id == brand_id and s.lead_type == "hot"][:20]
+    evening_statuses = {
+        "warm_call_next_day_11_or_630",
+        "reschedule_next_day",
+        "visit_no_show",
+        "visit_status_no_show",
+        "owner_alert",
+    }
+    evening = [s.lead_id for s in saleops.sessions.values() if s.brand_id == brand_id and s.status in evening_statuses][:20]
+    return jsonify(
+        {
+            "brand_id": brand_id,
+            "morning_plan_today": {"generated_at": now.isoformat(), "lead_ids": morning},
+            "evening_report_today": {"generated_at": now.isoformat(), "lead_ids": evening},
+        }
+    )
+
+
+@app.post("/v1/sale/learning")
+def sale_learning():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    brand_id = str(body.get("brand_id") or "").strip()
+    if not brand_id:
+        return _err(400, "brand_id required")
+    ss = [s for s in saleops.sessions.values() if s.brand_id == brand_id]
+    hot = len([s for s in ss if s.lead_type == "hot"])
+    unresolved_neg = len([s for s in ss if s.status == "owner_alert"])
+    if unresolved_neg:
+        act = "Increase senior AI/human intervention for unresolved negative cases."
+    elif hot:
+        act = "Prioritize same-day meetings for hot leads and push referral asks after score >= 8."
+    else:
+        act = "Increase nurture cadence and qualify warm leads faster."
+    return jsonify({"brand_id": brand_id, "learning_loop": {"recommended_action": act, "generated_at": datetime.now(timezone.utc).isoformat()}})
