@@ -2,8 +2,15 @@ from __future__ import annotations
 
 import base64
 import html
+import json
 import logging
 import os
+import queue
+import threading
+import time
+import traceback
+import urllib.request
+import uuid
 
 from .logging_config import configure_logging
 from .gcp_bootstrap import maybe_load_secrets
@@ -56,11 +63,12 @@ from .parallel_outreach import start_parallel_outreach
 from .whatsapp_nurture import process_due_nurtures
 from .cold_campaign_engine import enroll_cold_lead, process_due_cold_campaigns
 from .m1_ops import M1OpsStore, allocate_budget, suggest_platforms
+from .postsale_ops import PostSaleOpsStore
 from .sale_ops import SaleOpsStore
 from .salespal360_ops import SalesPal360Store
 from .sales_pipeline import merge_classification
 from .voice_stt import transcribe_audio_base64, transcribe_audio_url
-from .voice_tata import parse_event as parse_voice_tata_event, verify_webhook as verify_voice_tata_webhook
+from .voice_tata import call_outbound as tata_call_outbound, parse_event as parse_voice_tata_event, verify_webhook as verify_voice_tata_webhook
 from .voice_tts import synthesize as voice_synthesize
 from .conversation_store import Conversation
 from .zoho import (
@@ -83,9 +91,13 @@ zoho = ZohoClient()
 m1ops = M1OpsStore(os.getenv("M1_OPS_STORE_PATH") or "./m1_ops_store.json")
 sp360 = SalesPal360Store(os.getenv("SALESPAL360_STORE_PATH") or "./salespal360_store.json")
 saleops = SaleOpsStore(os.getenv("SALE_OPS_STORE_PATH") or "./sale_ops_store.json")
+postsaleops = PostSaleOpsStore(os.getenv("POSTSALE_OPS_STORE_PATH") or "./postsale_ops_store.json")
 
 log = logging.getLogger(__name__)
 rate_limiter = PublicRateLimiter()
+_RENDER_QUEUE: queue.Queue[str] = queue.Queue()
+_RENDER_LOCK = threading.Lock()
+_RENDER_JOBS: dict[str, dict[str, Any]] = {}
 
 _ADMIN_GUARDED_PREFIXES = (
     "/v1/integrations/zoho/",
@@ -95,6 +107,7 @@ _ADMIN_GUARDED_PREFIXES = (
     "/v1/marketing/ops/",
     "/v1/salespal360/",
     "/v1/sale/",
+    "/v1/postsale/",
 )
 _ADMIN_GUARDED_EXACT = {
     "/v1/marketing/posts/dispatch",
@@ -103,6 +116,36 @@ _PUBLIC_RATE_LIMITED = {
     "/v1/marketing/leads",
     "/v1/marketing/copy",
 }
+
+_VIDEO_LANGUAGE_LABELS: dict[str, str] = {
+    "auto": "Auto",
+    "en": "English",
+    "hi": "Hindi",
+    "hinglish": "Hinglish",
+    "ta": "Tamil",
+    "te": "Telugu",
+    "ml": "Malayalam",
+    "kn": "Kannada",
+    "mr": "Marathi",
+    "bn": "Bengali",
+    "gu": "Gujarati",
+    "pa": "Punjabi",
+    "ur": "Urdu",
+    "es": "Spanish",
+    "fr": "French",
+    "de": "German",
+    "ar": "Arabic",
+    "pt": "Portuguese",
+    "id": "Indonesian",
+}
+
+
+def _normalize_video_language(raw: Any) -> str:
+    v = str(raw or "auto").strip().lower() or "auto"
+    if v not in _VIDEO_LANGUAGE_LABELS:
+        allowed = ", ".join(sorted(_VIDEO_LANGUAGE_LABELS.keys()))
+        raise ValueError(f"video_language must be one of: {allowed}")
+    return v
 
 
 def _service_index_payload() -> dict[str, Any]:
@@ -124,11 +167,15 @@ def _service_index_payload() -> dict[str, Any]:
             "creative_assets": "/v1/marketing/creative-assets",
             "marketing_campaign": "/v1/marketing/campaign",
             "marketing_campaign_execute": "/v1/marketing/campaign/execute",
+            "marketing_campaign_execute_async": "/v1/marketing/campaign/execute_async",
+            "marketing_render_job_get": "/v1/marketing/render_jobs/<job_id>",
+            "marketing_render_job_list": "/v1/marketing/render_jobs",
             "marketing_copy": "/v1/marketing/copy",
             "marketing_leads": "/v1/marketing/leads",
             "marketing_lead_form_embed": "/v1/marketing/embed/lead-form",
             "voice_outreach_lead": "/v1/integrations/voice/outreach_lead/<lead_id>",
             "voice_outreach_leads": "/v1/integrations/voice/outreach_leads",
+            "voice_call_now": "/v1/integrations/voice/call_now",
             "voice_outreach_cron": "/v1/cron/voice_outreach",
             "parallel_outreach": "/v1/integrations/sales/parallel_outreach/<lead_id>",
             "sales_classify": "/v1/integrations/sales/leads/<lead_id>/classify",
@@ -143,6 +190,7 @@ def _service_index_payload() -> dict[str, Any]:
             "salespal360_sales_dashboard": "/v1/salespal360/sales/dashboard",
             "salespal360_m2_features": "/v1/salespal360/features/status",
             "sale_console": "/sale",
+            "postsale_console": "/post-sale",
         },
     }
 
@@ -1176,10 +1224,21 @@ def demo_ui():
               <option value="en">English</option>
               <option value="hi">Hindi</option>
               <option value="hinglish">Hinglish</option>
+              <option value="ta">Tamil</option>
+              <option value="te">Telugu</option>
+              <option value="ml">Malayalam</option>
+              <option value="kn">Kannada</option>
+              <option value="mr">Marathi</option>
+              <option value="bn">Bengali</option>
+              <option value="gu">Gujarati</option>
+              <option value="pa">Punjabi</option>
+              <option value="ur">Urdu</option>
               <option value="es">Spanish</option>
               <option value="fr">French</option>
               <option value="de">German</option>
               <option value="ar">Arabic</option>
+              <option value="pt">Portuguese</option>
+              <option value="id">Indonesian</option>
             </select>
             <label for="studio_objective">Objective</label>
             <input id="studio_objective" type="text" placeholder="e.g. Leads, awareness, installs" autocomplete="off" />
@@ -2169,9 +2228,10 @@ def marketing_campaign_route():
     objective = str(body.get("objective") or "").strip() or None
     copy_locked_lines = _parse_campaign_on_screen_lines(body.get("on_screen_lines"))
     primary_market = _normalize_primary_market(body.get("primary_market"))
-    video_language = str(body.get("video_language") or "auto").strip().lower() or "auto"
-    if len(video_language) > 24:
-        return _err(400, "video_language too long")
+    try:
+        video_language = _normalize_video_language(body.get("video_language"))
+    except ValueError as e:
+        return _err(400, str(e))
     logo_persistent = True if body.get("logo_persistent") is None else bool(body.get("logo_persistent"))
     video_aspect_ratio = str(body.get("video_aspect_ratio") or "16:9").strip()
     if video_aspect_ratio not in ("9:16", "16:9", "1:1"):
@@ -2358,8 +2418,9 @@ def marketing_campaign_route():
             if need_video_plan:
                 video_plan = derive_video_plan_from_brief(brief, total_seconds=v_total, clip_seconds=v_clip)
                 if isinstance(video_plan, dict) and video_language != "auto":
+                    lang_label = _VIDEO_LANGUAGE_LABELS.get(video_language, video_language)
                     lang_note = (
-                        f"Language requirement: all spoken voiceover and on-screen text should be in {video_language}. "
+                        f"Language requirement: all spoken voiceover and on-screen text should be in {lang_label} ({video_language}). "
                         "Keep wording natural for native speakers and do not mix unrelated languages."
                     )
                     vp = str(video_plan.get("video_prompt") or "").strip()
@@ -2446,6 +2507,44 @@ def marketing_campaign_route():
             }
         )
 
+    async_render = False if body.get("async_render") is None else bool(body.get("async_render"))
+    if async_render and gen_video:
+        row = _render_job_enqueue(
+            {
+                "brand_id": brand_id,
+                "video_aspect_ratio": video_aspect_ratio,
+                "generate_image": gen_image,
+                "generate_carousel": gen_carousel,
+                "generate_video": gen_video,
+                "require_approval": require_approval,
+                "options": base_opts,
+                "prompts_used": prompts_used,
+                "brief": brief,
+                "notify_webhook_url": str(body.get("notify_webhook_url") or "").strip() or None,
+                "notify_whatsapp_to": str(body.get("notify_whatsapp_to") or "").strip() or None,
+            }
+        )
+        return jsonify(
+            {
+                "brand_id": brand_id,
+                "brief": brief,
+                "brief_meta": brief_out.get("meta"),
+                "video_aspect_ratio": video_aspect_ratio,
+                "generate_image": gen_image,
+                "generate_carousel": gen_carousel,
+                "generate_video": gen_video,
+                "include_video": gen_video,
+                "prompts_used": prompts_used,
+                "jobs": [],
+                "queued": True,
+                "render_job": row,
+                "status_url": f"/v1/marketing/render_jobs/{row['job_id']}",
+                "plan_only": False,
+                "stage5": stage5_pending,
+                "stage6": stage6_pending_placeholder(),
+            }
+        )
+
     try:
         jobs = _run_campaign_asset_jobs(
             brand_id,
@@ -2517,9 +2616,50 @@ def marketing_campaign_execute_route():
     prompts_used = body.get("prompts_used")
     if not isinstance(prompts_used, dict):
         return _err(400, "prompts_used object required")
+    async_render = False if body.get("async_render") is None else bool(body.get("async_render"))
+    notify_webhook_url = str(body.get("notify_webhook_url") or "").strip() or None
+    notify_whatsapp_to = str(body.get("notify_whatsapp_to") or "").strip() or None
 
     if not brand_id or len(brand_id) > 64:
         return _err(400, "invalid brand_id")
+    if gen_video:
+        try:
+            req_total = body.get("video_total_seconds")
+            vp_total, _ = _validate_video_plan_or_raise(prompts_used)
+            if req_total is not None:
+                try:
+                    req_total_i = int(req_total)
+                except (TypeError, ValueError):
+                    return _err(400, "video_total_seconds must be an integer")
+                if req_total_i != vp_total:
+                    return _err(400, f"requested video_total_seconds={req_total_i} but planned total_seconds={vp_total}; regenerate plan before execute")
+        except ValueError as e:
+            return _err(400, str(e))
+
+    if async_render:
+        row = _render_job_enqueue(
+            {
+                "brand_id": brand_id,
+                "video_aspect_ratio": video_aspect_ratio,
+                "generate_image": gen_image,
+                "generate_carousel": gen_carousel,
+                "generate_video": gen_video,
+                "require_approval": require_approval,
+                "options": base_opts,
+                "prompts_used": prompts_used,
+                "brief": body.get("brief") if isinstance(body.get("brief"), dict) else None,
+                "notify_webhook_url": notify_webhook_url,
+                "notify_whatsapp_to": notify_whatsapp_to,
+            }
+        )
+        return jsonify(
+            {
+                "brand_id": brand_id,
+                "queued": True,
+                "render_job": row,
+                "status_url": f"/v1/marketing/render_jobs/{row['job_id']}",
+            }
+        )
 
     try:
         jobs = _run_campaign_asset_jobs(
@@ -2568,6 +2708,45 @@ def marketing_campaign_execute_route():
     )
 
 
+@app.post("/v1/marketing/campaign/execute_async")
+def marketing_campaign_execute_async_route():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    body["async_render"] = True
+    # Reuse validation and queue behavior from execute route.
+    with app.test_request_context(
+        path="/v1/marketing/campaign/execute",
+        method="POST",
+        json=body,
+        headers={k: v for k, v in request.headers.items()},
+    ):
+        return marketing_campaign_execute_route()
+
+
+@app.get("/v1/marketing/render_jobs/<job_id>")
+def marketing_render_job_get(job_id: str):
+    with _RENDER_LOCK:
+        row = _RENDER_JOBS.get(job_id)
+        if not row:
+            return _err(404, "render job not found")
+        return jsonify(_render_job_public(row))
+
+
+@app.get("/v1/marketing/render_jobs")
+def marketing_render_job_list():
+    brand_id = str(request.args.get("brand_id") or "").strip()
+    limit_raw = str(request.args.get("limit") or "50").strip()
+    try:
+        limit = max(1, min(200, int(limit_raw)))
+    except ValueError:
+        return _err(400, "limit must be an integer")
+    with _RENDER_LOCK:
+        rows = list(_RENDER_JOBS.values())
+    rows = sorted(rows, key=lambda x: str(x.get("created_at") or ""), reverse=True)
+    if brand_id:
+        rows = [r for r in rows if str(((r.get("payload") or {}).get("brand_id") or "")).strip() == brand_id]
+    return jsonify({"items": [_render_job_public(r) for r in rows[:limit]], "count": min(len(rows), limit)})
+
+
 def _run_asset_generation(
     brand_id: str,
     asset_type: str,
@@ -2595,6 +2774,210 @@ def _run_asset_generation(
         store.update(job)
 
     return job.__dict__
+
+
+def _strip_logo_prompt_directives(text: str) -> str:
+    lines = [ln for ln in (text or "").splitlines() if "LOGO_ASSET:" not in ln and "LOGO_CONTINUITY:" not in ln]
+    return "\n".join(lines).strip()
+
+
+def _validate_video_plan_or_raise(prompts_used: dict[str, Any]) -> tuple[int, int]:
+    vp = prompts_used.get("video")
+    if not isinstance(vp, dict):
+        raise ValueError("prompts_used missing video plan")
+    try:
+        total = int(vp.get("total_seconds") or 0)
+        clip = int(vp.get("clip_seconds") or 0)
+    except (TypeError, ValueError):
+        raise ValueError("video plan total_seconds/clip_seconds must be integers") from None
+    if total < 8 or total > 600:
+        raise ValueError("video plan total_seconds must be 8..600")
+    if clip not in {4, 6, 8}:
+        raise ValueError("video plan clip_seconds must be one of 4, 6, 8")
+    segs = (total + clip - 1) // clip
+    max_segs = int((os.getenv("VERTEX_VIDEO_MAX_SEGMENTS") or "30").strip() or "30")
+    if segs > max_segs:
+        raise ValueError(f"video plan requires {segs} clips; max allowed is {max_segs}")
+    return total, clip
+
+
+def _http_post_json(url: str, payload: dict[str, Any], timeout_sec: int = 20) -> tuple[bool, str]:
+    try:
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=max(3, min(90, timeout_sec))) as resp:
+            code = int(getattr(resp, "status", 200) or 200)
+            return (200 <= code < 300), f"http_{code}"
+    except Exception as e:
+        return False, str(e)
+
+
+def _render_job_enqueue(payload: dict[str, Any]) -> dict[str, Any]:
+    job_id = "rj_" + uuid.uuid4().hex[:20]
+    now = datetime.now(timezone.utc).isoformat()
+    row = {
+        "job_id": job_id,
+        "status": "queued",
+        "created_at": now,
+        "updated_at": now,
+        "started_at": None,
+        "finished_at": None,
+        "error": None,
+        "payload": payload,
+        "result": None,
+    }
+    with _RENDER_LOCK:
+        _RENDER_JOBS[job_id] = row
+    _RENDER_QUEUE.put(job_id)
+    return {k: v for k, v in row.items() if k != "payload"}
+
+
+def _render_job_public(job: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "job_id": job.get("job_id"),
+        "status": job.get("status"),
+        "created_at": job.get("created_at"),
+        "updated_at": job.get("updated_at"),
+        "started_at": job.get("started_at"),
+        "finished_at": job.get("finished_at"),
+        "error": job.get("error"),
+        "result": job.get("result"),
+    }
+
+
+def _notify_render_done(payload: dict[str, Any], result: dict[str, Any], ok: bool) -> None:
+    url = str(payload.get("notify_webhook_url") or "").strip()
+    wa_to = str(payload.get("notify_whatsapp_to") or "").strip()
+    if url:
+        _http_post_json(
+            url,
+            {
+                "type": "marketing_render_completed",
+                "ok": ok,
+                "brand_id": payload.get("brand_id"),
+                "job_id": payload.get("job_id"),
+                "result": result if ok else None,
+                "error": None if ok else result.get("error"),
+            },
+            timeout_sec=20,
+        )
+    if wa_to:
+        try:
+            if ok:
+                ms = int(result.get("tat_ms") or 0)
+                dur = result.get("video_actual_duration_seconds")
+                txt = (
+                    f"Render completed. Job {payload.get('job_id')} is ready."
+                    f" TAT {round(ms/1000,1)}s."
+                    + (f" Video duration {dur}s." if dur is not None else "")
+                )
+            else:
+                txt = f"Render failed. Job {payload.get('job_id')}. Error: {str(result.get('error') or 'unknown')[:500]}"
+            whatsapp_send_text(wa_to, txt)
+        except Exception:
+            log.exception("render job whatsapp notify")
+
+
+def _render_worker_loop() -> None:
+    while True:
+        job_id = _RENDER_QUEUE.get()
+        with _RENDER_LOCK:
+            row = _RENDER_JOBS.get(job_id)
+            if not row:
+                _RENDER_QUEUE.task_done()
+                continue
+            row["status"] = "running"
+            row["started_at"] = datetime.now(timezone.utc).isoformat()
+            row["updated_at"] = row["started_at"]
+            payload = dict(row.get("payload") or {})
+            payload["job_id"] = job_id
+            row["payload"] = payload
+        t0 = time.perf_counter()
+        try:
+            jobs = _run_campaign_asset_jobs(
+                payload["brand_id"],
+                prompts_used=payload["prompts_used"],
+                gen_image=bool(payload["generate_image"]),
+                gen_carousel=bool(payload["generate_carousel"]),
+                gen_video=bool(payload["generate_video"]),
+                video_aspect_ratio=str(payload["video_aspect_ratio"]),
+                require_approval=bool(payload.get("require_approval", False)),
+                base_opts=payload.get("options") if isinstance(payload.get("options"), dict) else None,
+            )
+            brief_exec = payload.get("brief") if isinstance(payload.get("brief"), dict) else None
+            stage6 = run_stage6_campaign_qa(
+                brief=brief_exec,
+                prompts_used=payload["prompts_used"],
+                jobs=jobs,
+                gen_image=bool(payload["generate_image"]),
+                gen_carousel=bool(payload["generate_carousel"]),
+                gen_video=bool(payload["generate_video"]),
+            )
+            video_actual = None
+            video_requested = None
+            for j in jobs:
+                if str(j.get("asset_type") or "").strip() == "video":
+                    vp = (payload.get("prompts_used") or {}).get("video")
+                    if isinstance(vp, dict):
+                        try:
+                            video_requested = int(vp.get("total_seconds") or 0)
+                        except (TypeError, ValueError):
+                            video_requested = None
+                    out = j.get("output")
+                    if isinstance(out, dict) and out.get("actual_duration_seconds") is not None:
+                        video_actual = out.get("actual_duration_seconds")
+                    break
+            duration_ok = None
+            if video_requested is not None and video_actual is not None:
+                duration_ok = abs(float(video_actual) - float(video_requested)) <= max(
+                    1.0, float((os.getenv("VERTEX_VIDEO_DURATION_TOLERANCE_SEC") or "3.0").strip() or "3.0")
+                )
+            result = {
+                "brand_id": payload["brand_id"],
+                "jobs": jobs,
+                "stage5": stage5_asset_manifest(
+                    gen_image=bool(payload["generate_image"]),
+                    gen_carousel=bool(payload["generate_carousel"]),
+                    gen_video=bool(payload["generate_video"]),
+                    prompts_used=payload["prompts_used"],
+                    status="completed",
+                ),
+                "stage6": stage6,
+                "tat_ms": int((time.perf_counter() - t0) * 1000),
+                "video_requested_total_seconds": video_requested,
+                "video_actual_duration_seconds": video_actual,
+                "qa": {
+                    "duration_match": duration_ok,
+                    "logo_hard_overlay_expected": bool((payload.get("prompts_used") or {}).get("logo_image_base64")),
+                    "audio_codec_target": "aac 48kHz stereo 192k",
+                },
+            }
+            with _RENDER_LOCK:
+                row2 = _RENDER_JOBS.get(job_id)
+                if row2:
+                    row2["status"] = "completed"
+                    row2["updated_at"] = datetime.now(timezone.utc).isoformat()
+                    row2["finished_at"] = row2["updated_at"]
+                    row2["result"] = result
+            _notify_render_done(payload, result, True)
+        except Exception as e:
+            err = str(e)
+            result = {"error": err, "trace": traceback.format_exc()[:4000], "tat_ms": int((time.perf_counter() - t0) * 1000)}
+            with _RENDER_LOCK:
+                row2 = _RENDER_JOBS.get(job_id)
+                if row2:
+                    row2["status"] = "failed"
+                    row2["error"] = err
+                    row2["updated_at"] = datetime.now(timezone.utc).isoformat()
+                    row2["finished_at"] = row2["updated_at"]
+                    row2["result"] = result
+            _notify_render_done(payload, result, False)
+        finally:
+            _RENDER_QUEUE.task_done()
+
+
+_render_worker = threading.Thread(target=_render_worker_loop, name="campaign-render-worker", daemon=True)
+_render_worker.start()
 
 
 def _run_campaign_asset_jobs(
@@ -2632,6 +3015,7 @@ def _run_campaign_asset_jobs(
         )
 
     if gen_video:
+        _validate_video_plan_or_raise(prompts_used)
         video_plan = prompts_used.get("video")
         if not isinstance(video_plan, dict):
             raise ValueError("prompts_used missing video plan")
@@ -2649,7 +3033,14 @@ def _run_campaign_asset_jobs(
         vov = video_plan.get("video_segment_overlays")
         if isinstance(vov, list) and any(str(x).strip() for x in vov):
             vid_opts["video_segment_overlays"] = [str(x) for x in vov]
+        logo_b64 = str(prompts_used.get("logo_image_base64") or "").strip()
+        logo_mt = str(prompts_used.get("logo_image_mime_type") or "").strip()
+        if logo_b64:
+            vid_opts["video_logo_image_base64"] = logo_b64
+            if logo_mt:
+                vid_opts["video_logo_image_mime_type"] = logo_mt
         v_prompt = str(video_plan.get("video_prompt") or "").strip()
+        v_prompt = _strip_logo_prompt_directives(v_prompt)
         if not v_prompt:
             raise ValueError("prompts_used missing video_prompt")
         jobs.append(_run_asset_generation(brand_id, "video", v_prompt, 1, require_approval, vid_opts))
@@ -3518,6 +3909,83 @@ def integrations_voice_outreach_leads():
     return jsonify(batch)
 
 
+@app.post("/v1/integrations/voice/call_now")
+def integrations_voice_call_now():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    brand_id = str(body.get("brand_id") or "").strip()
+    lead_id = str(body.get("lead_id") or "").strip()
+    phone = str(body.get("phone") or "").strip()
+    name = str(body.get("name") or "").strip() or None
+    locale = str(body.get("locale") or os.getenv("VOICE_DEFAULT_LOCALE") or "hing").strip().lower()
+    if locale not in {"hing", "hi", "en"}:
+        return _err(400, "locale must be one of: hing, hi, en")
+    if not brand_id:
+        return _err(400, "brand_id required")
+
+    lead = leads.get(lead_id) if lead_id else None
+    if lead is None and phone:
+        existing = leads.find_by_brand_and_phone(brand_id, phone)
+        if existing is not None:
+            lead = existing
+            lead_id = existing.id
+        else:
+            try:
+                lead, _ = leads.upsert(
+                    brand_id=brand_id,
+                    source="sale_voice_console",
+                    name=name,
+                    email=None,
+                    phone=phone,
+                    company=None,
+                    message="Created from /sale voice console call_now",
+                    utm=None,
+                    raw={"voice_manual_call_requested_at": datetime.now(timezone.utc).isoformat(), "sales_language": locale},
+                    idempotency_key=None,
+                )
+                lead_id = lead.id
+            except Exception as e:
+                return _err(400, f"could not create lead from phone: {e}")
+    if lead is None:
+        return _err(400, "lead_id not found. Provide a valid lead_id or provide phone to auto-create a lead.")
+
+    try:
+        conv = conversations.create(
+            lead_id=lead.id,
+            brand_id=brand_id,
+            channel="voice",
+            locale=locale,
+            metadata={"voice_manual": True},
+        )
+        opening = str(conv.turns[0].get("content") or "").strip() if conv.turns else ""
+        if not opening:
+            opening = "Hello, this is SalesPal calling to understand your requirements."
+        tts_payload = voice_synthesize(opening)
+        call_resp = tata_call_outbound(to_phone=str(lead.phone or phone), brand_id=brand_id, text=opening, tts_payload=tts_payload)
+        leads.merge_raw(
+            lead.id,
+            {
+                "voice_manual_call_requested_at": datetime.now(timezone.utc).isoformat(),
+                "voice_manual_conversation_id": conv.id,
+                "voice_last_call_response": call_resp,
+            },
+        )
+    except Exception as e:
+        log.exception("voice call now")
+        return _err(502, str(e))
+
+    return jsonify(
+        {
+            "status": "queued",
+            "brand_id": brand_id,
+            "lead_id": lead.id,
+            "conversation_id": conv.id,
+            "locale": locale,
+            "provider": str(call_resp.get("provider") or "tata"),
+            "call_response": call_resp,
+        }
+    )
+
+
 @app.post("/v1/integrations/whatsapp/outreach_lead/<lead_id>")
 def integrations_whatsapp_outreach_lead(lead_id: str):
     if not _whatsapp_send_configured():
@@ -3710,216 +4178,8 @@ def _append_lead_raw_event(lead_id: str, key: str, event: dict[str, Any]) -> dic
 
 @app.get("/marketing")
 def marketing_console():
-    html = """<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>SalesPal Marketing Engine</title>
-  <style>
-    :root { --bg:#eef2f7; --card:#fff; --text:#0f172a; --muted:#64748b; --line:#d8e0ea; --orange:#ea580c; --green:#15803d; --blue:#0369a1; --pink:#be185d; --yellow:#ca8a04; }
-    *{ box-sizing:border-box; } body{ margin:0; background:var(--bg); color:var(--text); font-family:Inter,system-ui,Arial,sans-serif; }
-    .wrap{ max-width:1320px; margin:0 auto; padding:16px; }
-    .hero{ background:linear-gradient(135deg,var(--orange),#c2410c); color:#fff; border-radius:14px; padding:16px 18px; margin-bottom:14px; border:2px solid #fed7aa; }
-    .hero .sub{ color:#ffedd5; font-size:13px; margin-top:6px; line-height:1.45; }
-    .pipeline{ display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
-    .pipe{ font-size:11px; font-weight:800; padding:6px 10px; border-radius:8px; background:#fff7ed; color:#9a3412; border:1px solid #fdba74; }
-    .grid{ display:grid; grid-template-columns:2.1fr 1fr; gap:12px; } @media(max-width:1080px){ .grid{ grid-template-columns:1fr; } }
-    .card{ background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px; margin-bottom:12px; }
-    .card h2{ margin:0 0 10px; font-size:17px; display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
-    .tag{ font-size:10px; font-weight:800; text-transform:uppercase; padding:3px 8px; border-radius:6px; color:#fff; }
-    .tag.core{ background:var(--orange);} .tag.ai{ background:var(--green);} .tag.soc{ background:var(--blue);} .tag.ads{ background:var(--pink);} .tag.cam{ background:var(--yellow); color:#422006;}
-    h3{ margin:0 0 8px; font-size:14px; color:var(--muted); text-transform:uppercase; letter-spacing:.06em; }
-    label{ font-size:11px; color:var(--muted); display:block; margin:8px 0 4px; font-weight:700; text-transform:uppercase; letter-spacing:.04em; }
-    input,select,textarea{ width:100%; padding:8px 10px; border:1px solid var(--line); border-radius:8px; font:inherit; background:#fff; }
-    textarea{ min-height:72px; resize:vertical; }
-    .row{ display:grid; grid-template-columns:1fr 1fr; gap:10px; } @media(max-width:720px){ .row{ grid-template-columns:1fr; } }
-    .btns{ display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
-    button{ border:0; border-radius:9px; padding:8px 12px; font-weight:700; cursor:pointer; background:var(--blue); color:#fff; font-size:13px; }
-    button.alt{ background:#334155; } button.good{ background:var(--green); } button.warn{ background:#b91c1c; }
-    .hint{ color:var(--muted); font-size:12px; margin-top:6px; line-height:1.45; }
-    .flowline{ border-left:3px solid #fb923c; padding-left:12px; margin:8px 0 0 4px; }
-    .asset-grid{ display:grid; grid-template-columns:repeat(auto-fill,minmax(140px,1fr)); gap:8px; margin-top:8px; }
-    .asset{ border:1px dashed var(--line); border-radius:8px; padding:8px; font-size:12px; background:#f8fafc; }
-    pre{ margin:0; white-space:pre-wrap; word-break:break-word; background:#0f172a; color:#e2e8f0; border-radius:10px; padding:10px; max-height:52vh; overflow:auto; font-size:11px; }
-    .jump{ display:flex; flex-wrap:wrap; gap:8px; margin:10px 0; }
-    .jump a{ color:#0369a1; font-weight:700; font-size:13px; }
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <div class="hero">
-      <strong style="font-size:18px;">SalesPal Marketing Engine</strong>
-      <div class="sub">Business Input → AI Analysis → Brand Setup → Audience + Budget → AI Content Creation → Preview → Action Type (Social / Ads / Broadcast) → Lead Management → Dashboard → Digital Presence → AI Optimization Loop → Content.</div>
-      <div class="pipeline">
-        <span class="pipe">Business Input</span><span class="pipe">AI Analysis (USP / Audience / Industry)</span><span class="pipe">Brand Setup (Tone / Style)</span>
-        <span class="pipe">Audience Targeting + Budget Suggestion</span><span class="pipe">AI Content Creation</span>
-      </div>
-    </div>
-    <div class="grid">
-      <main>
-        <section class="card">
-          <h2><span class="tag core">Pipeline</span> Business input → AI plan → content</h2>
-          <div class="row">
-            <div><label>Brand Id</label><input id="brand" value="demo" /></div>
-            <div><label>Admin API Key</label><input id="adminkey" placeholder="if /v1/marketing/ops requires it" /></div>
-          </div>
-          <div class="row">
-            <div><label>Source Type</label><select id="src"><option value="text">Brief text</option><option value="url">Website URL</option></select></div>
-            <div><label>Objective</label><input id="obj" value="lead generation" /></div>
-          </div>
-          <label>Business Input (Website / PDFs / Product / Manual)</label>
-          <textarea id="brief" placeholder="Paste brief, or paste website URL when source = URL"></textarea>
-          <div class="row">
-            <div><label>Primary Market</label><input id="pm" value="India" /></div>
-            <div><label>Audience hint (for AI)</label><input id="audhint" value="SME owners" /></div>
-          </div>
-          <div class="flowline hint">AI Analysis + Brand + Audience are produced inside <code>POST /v1/marketing/campaign</code> (plan). Use <strong>Plan only</strong> first to preview prompts without burning credits on execution.</div>
-          <div class="asset-grid">
-            <label class="asset"><input type="checkbox" id="gimg" checked /> Images</label>
-            <label class="asset"><input type="checkbox" id="gvid" checked /> Videos / Reels</label>
-            <label class="asset"><input type="checkbox" id="gcar" checked /> Carousel</label>
-            <div class="asset" title="Generated with campaign plan">Caption + CTA <small style="color:#64748b">(in brief)</small></div>
-          </div>
-          <p class="hint"><strong>Sample Content View (preview):</strong> API response after Plan. <strong>Execute</strong> generates assets (may incur cost). Optional 3D/stitched preview depends on product config.</p>
-          <div class="btns">
-            <button onclick="runM1Plan()">AI Analysis + Plan (preview)</button>
-            <button class="good" onclick="runM1Exec()">Generate assets (execute)</button>
-          </div>
-        </section>
-
-        <section class="card">
-          <h2><span class="tag ai">Decision</span> Action Type</h2>
-          <p class="hint">Choose where to go next (same APIs as below).</p>
-          <div class="jump">
-            <a href="#sec-social">→ Social Posting → Social Media Engine</a>
-            <a href="#sec-ads">→ Run Ads → Ads Engine</a>
-            <a href="#sec-campaign">→ Broadcast Campaign → Campaign Engine</a>
-          </div>
-        </section>
-
-        <section class="card" id="sec-social">
-          <h2><span class="tag soc">Social</span> Social Media Engine</h2>
-          <p class="hint">Connect accounts (Meta / IG / LinkedIn / X / YouTube) · Post Now / Schedule · Auto Publish · Engagement Tracking · Platform Suggestion</p>
-          <div class="row">
-            <div><label>Platform</label><select id="platform"><option>instagram</option><option>facebook</option><option>linkedin</option><option>x</option><option>youtube</option></select></div>
-            <div><label>Account Handle</label><input id="handle" placeholder="@brand"/></div>
-          </div>
-          <div class="btns">
-            <button onclick="connectSocial()">Connect Account</button>
-            <button class="alt" onclick="platformSuggest()">Platform Suggestion</button>
-          </div>
-          <div class="row">
-            <div><label>Post mode</label><select id="pmode"><option value="post_now">Post Now</option><option value="schedule">Schedule</option><option value="auto_publish">Auto Publish</option></select></div>
-            <div><label>Schedule at (ISO, if schedule)</label><input id="pwhen" placeholder="2026-04-10T10:00:00+00:00" /></div>
-          </div>
-          <div class="btns">
-            <button onclick="socialPost()">Post / Schedule</button>
-            <button class="good" onclick="socialEng()">Engagement Tracking +1</button>
-          </div>
-        </section>
-
-        <section class="card" id="sec-ads">
-          <h2><span class="tag ads">Ads</span> Ads Engine</h2>
-          <p class="hint">Budget Allocation · Ad Launch · Basic Optimization · Lead Capture</p>
-          <div class="row">
-            <div><label>Campaign Name</label><input id="adname" value="Launch Campaign"/></div>
-            <div><label>Total Budget</label><input id="budget" type="number" value="50000"/></div>
-          </div>
-          <div class="btns">
-            <button onclick="allocate()">Budget Allocation</button>
-            <button onclick="adLaunch()">Ad Launch</button>
-            <button class="alt" onclick="adOptimize()">Basic Optimization</button>
-            <button class="good" onclick="adLeadCap()">Lead Capture</button>
-          </div>
-        </section>
-
-        <section class="card" id="sec-campaign">
-          <h2><span class="tag cam">Campaign</span> Campaign Engine (Broadcast)</h2>
-          <p class="hint">WhatsApp · SMS · Email · RCS · Audience Selection · Schedule + Timing · Incoming Responses</p>
-          <div class="row">
-            <div><label>Channel</label><select id="bch"><option>whatsapp</option><option>sms</option><option>email</option><option>rcs</option></select></div>
-            <div><label>Schedule (UTC iso)</label><input id="bsch" placeholder="optional"/></div>
-          </div>
-          <label>Audience (JSON)</label><textarea id="aud">{ "segment": "new_leads" }</textarea>
-          <div class="btns">
-            <button onclick="broadcastCreate()">Create Broadcast</button>
-            <button class="alt" onclick="broadcastResponse()">Incoming Responses +1</button>
-          </div>
-        </section>
-
-        <section class="card">
-          <h2><span class="tag soc">Leads</span> Lead Management (Manual)</h2>
-          <p class="hint">Lead details (Name / Source / Interest via API) · Mark Hot/Warm/Cold · Notes · Follow-up · History · Manual follow-up · Send to Sales (optional)</p>
-          <div class="row">
-            <div><label>Lead Id</label><input id="leadid" placeholder="paste lead id"/></div>
-            <div><label>Mark Lead</label><select id="leadtemp"><option>hot</option><option>warm</option><option>cold</option></select></div>
-          </div>
-          <label>Interest / notes</label><textarea id="leadnote"></textarea>
-          <label>Follow-up (UTC iso)</label><input id="follow" placeholder="2026-04-08T12:00:00+00:00"/>
-          <div class="btns">
-            <button onclick="leadNote()">Add Notes</button>
-            <button onclick="leadFollow()">Set Follow-up</button>
-            <button onclick="leadMark()">Mark Temperature</button>
-            <button class="alt" onclick="leadHistory()">View History</button>
-          </div>
-          <div class="btns">
-            <button onclick="sendOwner()">Send Lead to Owner (WhatsApp)</button>
-            <button class="alt" onclick="manualFu()">Manual Follow-up</button>
-            <button class="good" onclick="sendSales()">Send to Sales Engine</button>
-          </div>
-          <div class="row">
-            <div><label>Manual channel</label><select id="fuch"><option value="call">Call</option><option value="whatsapp">WhatsApp</option></select></div>
-            <div><label>Status text</label><input id="fust" value="contacted" /></div>
-          </div>
-        </section>
-      </main>
-      <aside>
-        <section class="card">
-          <h3>Dashboard</h3>
-          <p class="hint">Engagement metrics · Campaign performance · Lead insights (includes next-action hint)</p>
-          <div class="btns"><button onclick="dash()">Dashboard</button></div>
-        </section>
-        <section class="card">
-          <h3>Optimization loop</h3>
-          <p class="hint">Digital Presence Score → AI Optimization Loop → feeds back to AI Content Creation</p>
-          <div class="btns"><button class="good" onclick="optLoop()">AI Optimization Loop</button></div>
-        </section>
-        <section class="card"><h3>API response</h3><pre id="out">Ready.</pre></section>
-      </aside>
-    </div>
-  </div>
-<script>
-const out=document.getElementById('out');
-let lastPlan=null, lastBroadcastId=null, lastAdCampaignId=null;
-function hdr(){const h={'Content-Type':'application/json'};const k=(document.getElementById('adminkey').value||'').trim();if(k)h['X-Admin-Api-Key']=k;return h;}
-async function api(p,m='GET',b=null){const r=await fetch(p,{method:m,headers:hdr(),body:b?JSON.stringify(b):null});const j=await r.json().catch(()=>({raw:'non-json'}));if(!r.ok)j._http={status:r.status};out.textContent=JSON.stringify(j,null,2);return j;}
-function brand(){return (document.getElementById('brand').value||'demo').trim();}
-function genFlags(){return{generate_image:document.getElementById('gimg').checked,generate_video:document.getElementById('gvid').checked,generate_carousel:document.getElementById('gcar').checked};}
-async function runM1Plan(){const st=document.getElementById('src').value;const inp=(document.getElementById('brief').value||'').trim();const g=genFlags();const body={brand_id:brand(),source_type:st,objective:document.getElementById('obj').value,primary_market:document.getElementById('pm').value,plan_only:true,...g};if(st==='url')body.url=inp;else body.text=inp;if((document.getElementById('audhint').value||'').trim())body.audience_hint=(document.getElementById('audhint').value||'').trim();const j=await api('/v1/marketing/campaign','POST',body);if(j&&j._http)lastPlan=null;else if(j&&j.prompts_used)lastPlan=j;else lastPlan=null;return j;}
-async function runM1Exec(){let p=lastPlan;if(!p||!p.prompts_used)p=await runM1Plan();if(!p||p._http||!p.prompts_used)return;const g=genFlags();await api('/v1/marketing/campaign/execute','POST',{brand_id:p.brand_id||brand(),prompts_used:p.prompts_used,brief:p.brief,...g});}
-async function connectSocial(){await api('/v1/marketing/ops/social/connect','POST',{brand_id:brand(),platform:document.getElementById('platform').value,account_handle:document.getElementById('handle').value});}
-async function platformSuggest(){await api('/v1/marketing/ops/social/platform_suggestion','POST',{brand_id:brand(),objective:document.getElementById('obj').value,audience:(document.getElementById('audhint').value||'business')});}
-async function socialPost(){await api('/v1/marketing/ops/social/post_schedule','POST',{brand_id:brand(),platform:document.getElementById('platform').value,mode:document.getElementById('pmode').value,schedule_at:document.getElementById('pwhen').value});}
-async function socialEng(){await api('/v1/marketing/ops/social/engagement','POST',{brand_id:brand(),delta:1});}
-async function allocate(){await api('/v1/marketing/ops/ads/budget_allocation','POST',{brand_id:brand(),objective:document.getElementById('obj').value,budget_total:Number(document.getElementById('budget').value||0)});}
-async function adLaunch(){const j=await api('/v1/marketing/ops/ads/launch','POST',{brand_id:brand(),name:document.getElementById('adname').value,objective:document.getElementById('obj').value,budget_total:Number(document.getElementById('budget').value||0)});if(j&&j.campaign&&j.campaign.id)lastAdCampaignId=j.campaign.id;}
-async function adOptimize(){await api('/v1/marketing/ops/ads/optimize','POST',{brand_id:brand()});}
-async function adLeadCap(){await api('/v1/marketing/ops/ads/lead_capture','POST',{brand_id:brand(),campaign_id:lastAdCampaignId||'last',note:'lead_capture_from_console'});}
-async function broadcastCreate(){let aud={};try{aud=JSON.parse(document.getElementById('aud').value||'{}')}catch(e){} const j=await api('/v1/marketing/ops/broadcast/campaign','POST',{brand_id:brand(),channel:document.getElementById('bch').value,schedule_at:document.getElementById('bsch').value,audience:aud});if(j&&j.campaign&&j.campaign.id)lastBroadcastId=j.campaign.id;}
-async function broadcastResponse(){const id=lastBroadcastId;if(!id){out.textContent='Create a broadcast first, then click Incoming Responses.';return;} await api('/v1/marketing/ops/broadcast/response','POST',{campaign_id:id,count:1});}
-async function leadNote(){await api('/v1/marketing/ops/leads/'+encodeURIComponent(document.getElementById('leadid').value)+'/note','POST',{note:document.getElementById('leadnote').value});}
-async function leadFollow(){await api('/v1/marketing/ops/leads/'+encodeURIComponent(document.getElementById('leadid').value)+'/followup','POST',{follow_up_at:document.getElementById('follow').value});}
-async function leadMark(){await api('/v1/marketing/ops/leads/'+encodeURIComponent(document.getElementById('leadid').value)+'/mark','POST',{temperature:document.getElementById('leadtemp').value});}
-async function leadHistory(){await api('/v1/marketing/ops/leads/'+encodeURIComponent(document.getElementById('leadid').value)+'/history');}
-async function sendOwner(){await api('/v1/marketing/ops/leads/'+encodeURIComponent(document.getElementById('leadid').value)+'/send_to_owner','POST',{message:'New lead from marketing console'});}
-async function manualFu(){await api('/v1/marketing/ops/leads/'+encodeURIComponent(document.getElementById('leadid').value)+'/manual_followup','POST',{channel:document.getElementById('fuch').value,status:document.getElementById('fust').value});}
-async function sendSales(){await api('/v1/marketing/ops/leads/'+encodeURIComponent(document.getElementById('leadid').value)+'/send_to_sales','POST',{});}
-async function dash(){await api('/v1/marketing/ops/dashboard?brand_id='+encodeURIComponent(brand()));}
-async function optLoop(){await api('/v1/marketing/ops/optimization/loop?brand_id='+encodeURIComponent(brand()));}
-</script>
-</body></html>"""
-    return Response(html, mimetype="text/html; charset=utf-8")
+    # Milestone 1 now uses the demo console.
+    return demo_ui()
 
 
 @app.post("/v1/marketing/ops/social/connect")
@@ -5023,6 +5283,12 @@ def sale_console():
       <div class="btns"><button onclick="startParallel()">Start Call + WhatsApp Together</button><button class="ghost" onclick="timeline()">Refresh Timeline</button></div>
     </section>
 
+    <section class="card step" id="s-voice"><h2>Direct Bot Call (Voice Provider)</h2>
+      <div class="row"><div><label>Phone Number (required if lead not found)</label><input id="voice_phone" placeholder="+91XXXXXXXXXX"/></div><div><label>Contact Name (optional)</label><input id="voice_name" placeholder="Customer name"/></div></div>
+      <div class="row"><div><label>Call Locale</label><select id="voice_locale"><option value="hing" selected>hing</option><option value="hi">hi</option><option value="en">en</option></select></div><div><label>Action</label><button onclick="callNow()">Call Bot Now</button></div></div>
+      <div class="tiny">Uses Tata voice integration via <code>/v1/integrations/voice/call_now</code>. If lead_id is empty, system can create/find lead by phone.</div>
+    </section>
+
     <section class="card step" id="s-channel"><h2>Channel Outcomes (Call + WhatsApp)</h2>
       <div class="row"><div><label>Call Result</label><select id="cr"><option>no_answer</option><option>busy</option><option>wrong_number</option><option>connected</option></select></div><div><label>WhatsApp Reply (No -> Follow-up, Yes -> Conversation)</label><select id="wr"><option>no</option><option>yes</option></select></div></div>
       <div class="btns">
@@ -5140,6 +5406,16 @@ async function waReply(){const j=await api('/v1/sale/wa_reply','POST',{brand_id:
 async function userType(){const j=await api('/v1/sale/user_type','POST',{brand_id:brand(),lead_id:lead(),user_type:document.getElementById('ut').value});if(j&&j.session&&j.session.status){current=j.session.status;allowed=[];renderAllowed();}}
 async function qualify(){const j=await api('/v1/sale/qualification','POST',{brand_id:brand(),lead_id:lead(),lead_type:document.getElementById('lt').value,need_budget_timeline:document.getElementById('nbt').value});if(j&&j.session&&j.session.status){current=j.session.status;allowed=[];renderAllowed();}}
 async function score(){await api('/v1/sale/score','POST',{brand_id:brand(),lead_id:lead(),score:Number(document.getElementById('score').value||0),resolved:(document.getElementById('res').value==='yes')});}
+async function callNow(){
+  const j=await api('/v1/integrations/voice/call_now','POST',{
+    brand_id:brand(),
+    lead_id:lead(),
+    phone:(document.getElementById('voice_phone').value||'').trim(),
+    name:(document.getElementById('voice_name').value||'').trim(),
+    locale:(document.getElementById('voice_locale').value||'hing').trim()
+  });
+  if(j&&j.lead_id){document.getElementById('lead').value=j.lead_id;}
+}
 async function dash(){await api('/v1/sale/dashboard?brand_id='+encodeURIComponent(brand()));}
 async function learn(){await api('/v1/sale/learning','POST',{brand_id:brand()});}
 async function timeline(){
@@ -5543,3 +5819,620 @@ def sale_learning():
     else:
         act = "Increase nurture cadence and qualify warm leads faster."
     return jsonify({"brand_id": brand_id, "learning_loop": {"recommended_action": act, "generated_at": datetime.now(timezone.utc).isoformat()}})
+
+
+_POSTSALE_ALLOWED_BY_STATUS: dict[str, set[str]] = {
+    "started": {"load_requirements"},
+    "load_requirements": {"set_payment_pending", "set_payment_partial", "request_documents"},
+    "set_payment_pending": {"send_payment_reminder"},
+    "send_payment_reminder": {"retry_d0_d3_d5_d7"},
+    "retry_d0_d3_d5_d7": {"send_payment_reminder", "set_payment_partial"},
+    "set_payment_partial": {"ask_payment_proof"},
+    "ask_payment_proof": {"receive_proof"},
+    "receive_proof": {"send_to_owner_verification"},
+    "send_to_owner_verification": {"owner_whatsapp_verify_payment"},
+    "owner_whatsapp_verify_payment": {"owner_confirm_yes", "owner_confirm_no"},
+    "owner_confirm_yes": {"send_second_confirmation"},
+    "send_second_confirmation": {"confirm_again_yes", "confirm_again_no"},
+    "confirm_again_yes": {"update_payment"},
+    "confirm_again_no": {"cancel_update"},
+    "owner_confirm_no": {"cancel_update"},
+    "cancel_update": {"set_payment_partial"},
+    "request_documents": {"doc_followup_d0_d2_d4", "receive_document"},
+    "doc_followup_d0_d2_d4": {"request_documents", "receive_document"},
+    "receive_document": {"validate_document"},
+    "validate_document": {"all_requirements_done"},
+    "update_payment": {"all_requirements_done"},
+    "all_requirements_done": {"issue_remaining_yes", "issue_remaining_no"},
+    "issue_remaining_yes": {"ai_try_resolve"},
+    "ai_try_resolve": {"resolved_yes", "resolved_no"},
+    "resolved_yes": {"proceed"},
+    "resolved_no": {"owner_intervention"},
+    "owner_intervention": {"proceed"},
+    "issue_remaining_no": {"proceed"},
+    "proceed": {"ask_rating_1_10"},
+    "ask_rating_1_10": {"score_8_10", "score_5_7", "score_1_4"},
+    "score_8_10": {"save_testimonial", "ask_referral"},
+    "score_5_7": {"ask_improvement", "soft_referral"},
+    "score_1_4": {"ai_resolve_first"},
+    "ai_resolve_first": {"negative_resolved_yes", "negative_resolved_no"},
+    "negative_resolved_yes": {"close"},
+    "negative_resolved_no": {"owner_alert"},
+    "save_testimonial": {"update_dashboard"},
+    "ask_referral": {"update_dashboard"},
+    "ask_improvement": {"update_dashboard"},
+    "soft_referral": {"update_dashboard"},
+    "close": {"update_dashboard"},
+    "owner_alert": {"update_dashboard"},
+    "update_dashboard": {"morning_plan", "evening_report", "learning_loop"},
+    "morning_plan": set(),
+    "evening_report": set(),
+    "learning_loop": {"load_requirements", "post_sale_system"},
+    "post_sale_system": set(),
+}
+
+
+def _postsale_next_allowed(status: str) -> list[str]:
+    return sorted(_POSTSALE_ALLOWED_BY_STATUS.get(status, set()))
+
+
+def _parse_bool_field(body: dict[str, Any], key: str, *, required: bool = False) -> bool | None:
+    if key not in body or body.get(key) is None:
+        if required:
+            raise ValueError(f"{key} is required")
+        return None
+    value = body.get(key)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        raw = value.strip().lower()
+        if raw in {"true", "1", "yes", "y"}:
+            return True
+        if raw in {"false", "0", "no", "n"}:
+            return False
+    raise ValueError(f"{key} must be boolean")
+
+
+def _postsale_apply_actions(brand_id: str, lead_id: str, actions: list[str], *, event_type: str, payload: dict[str, Any], stage: str) -> Any:
+    cur = postsaleops.get_session(brand_id=brand_id, lead_id=lead_id)
+    current_status = cur.status if cur else "started"
+    initial_status = current_status
+    next_action_at = None
+    for action in actions:
+        allowed = _postsale_next_allowed(current_status)
+        if action not in allowed:
+            raise ValueError(f"invalid transition from {current_status} -> {action}; allowed next: {', '.join(allowed) if allowed else '(none)'}")
+        current_status = action
+        if action in {"retry_d0_d3_d5_d7", "doc_followup_d0_d2_d4", "reschedule_next_day"}:
+            next_action_at = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+
+    s = postsaleops.upsert_session(
+        brand_id=brand_id,
+        lead_id=lead_id,
+        stage=stage,
+        status=current_status,
+        next_action_at=next_action_at,
+    )
+    postsaleops.add_event(brand_id=brand_id, lead_id=lead_id, event_type=event_type, payload=payload | {"actions": actions, "final_status": current_status})
+    return s, {
+        "initial_status": initial_status,
+        "actions_applied": actions,
+        "final_status": current_status,
+        "stage": stage,
+    }
+
+
+def _postsale_ok(session: Any, *, event: Any | None = None, audit: dict[str, Any] | None = None):
+    payload: dict[str, Any] = {
+        "session": session.__dict__,
+        "next_allowed_actions": _postsale_next_allowed(session.status),
+    }
+    if event is not None:
+        payload["event"] = event.__dict__
+    if audit is not None:
+        payload["audit"] = audit
+    return jsonify(payload)
+
+
+def _postsale_data(data: dict[str, Any], *, audit: dict[str, Any] | None = None):
+    payload: dict[str, Any] = {"data": data}
+    if audit is not None:
+        payload["audit"] = audit
+    return jsonify(payload)
+
+
+@app.get("/post-sale")
+def postsale_console():
+    html = """<!doctype html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Post Sale Engine</title><style>
+  :root{--bg:#f1f5f9;--panel:#ffffff;--line:#d9e1ea;--text:#0f172a;--muted:#64748b;--accent:#0f4c81}
+  *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font-family:Inter,Arial,sans-serif}
+  .wrap{max-width:1320px;margin:0 auto;padding:16px}.hero{background:linear-gradient(135deg,#0f4c81,#155e75);color:#fff;padding:14px 16px;border-radius:12px;margin-bottom:12px}
+  .grid{display:grid;grid-template-columns:2fr 1fr;gap:12px}@media(max-width:1100px){.grid{grid-template-columns:1fr}}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px;margin-bottom:12px}
+  .row{display:grid;grid-template-columns:1fr 1fr;gap:10px}@media(max-width:780px){.row{grid-template-columns:1fr}}
+  label{display:block;font-size:11px;font-weight:700;color:var(--muted);margin:7px 0 3px;text-transform:uppercase}
+  input,select,textarea{width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:#fff;font:inherit}
+  .btns{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px} button{border:0;border-radius:8px;padding:8px 10px;background:var(--accent);color:#fff;font-weight:700;cursor:pointer}
+  .chip{font-size:11px;padding:4px 8px;border-radius:999px;background:#e2e8f0;font-weight:700;margin-right:6px;display:inline-block}
+  pre{margin:0;white-space:pre-wrap;word-break:break-word;background:#0f172a;color:#e2e8f0;border-radius:10px;padding:10px;max-height:70vh;overflow:auto;font-size:12px}
+</style></head><body><div class="wrap">
+  <div class="hero"><strong>Post Sale Engine</strong><div style="font-size:12px;color:#dbeafe">Condition-based flow: backend computes transitions from your inputs.</div></div>
+  <div class="grid"><main>
+    <section class="card"><h3>Start</h3>
+      <div class="row"><div><label>Brand Id</label><input id="brand" value="demo"/></div><div><label>Lead Id</label><input id="lead" placeholder="lead id"/></div></div>
+      <div class="row"><div><label>Admin API Key</label><input id="adminkey" placeholder="X-Admin-Api-Key"/></div><div><label>Timezone</label><input id="tz" value="Asia/Kolkata"/></div></div>
+      <div class="row"><div><label>Language</label><select id="lang"><option value="hinglish" selected>hinglish</option><option value="hi">hi</option><option value="en">en</option></select></div><div><label>Auto Language Switch</label><select id="autosw"><option value="true" selected>true</option><option value="false">false</option></select></div></div>
+      <div class="btns"><button onclick="start()">Start + Load Requirements</button><button onclick="timeline()">Timeline</button></div>
+    </section>
+    <section class="card"><h3>Payment Flow</h3>
+      <div class="row"><div><label>Payment Status</label><select id="pay"><option value="pending">pending</option><option value="partial">partial</option></select></div><div><label>Owner Confirm?</label><select id="owner_confirm"><option value="">n/a</option><option value="yes">yes</option><option value="no">no</option></select></div></div>
+      <div class="row"><div><label>Confirm Again?</label><select id="confirm_again"><option value="">n/a</option><option value="yes">yes</option><option value="no">no</option></select></div><div><label>Note</label><input id="pay_note" placeholder="optional"/></div></div>
+      <div class="btns"><button onclick="paymentFlow()">Process Payment Flow</button></div>
+    </section>
+    <section class="card"><h3>Document + Issue Flow</h3>
+      <div class="row"><div><label>Document Status</label><select id="doc"><option value="pending">pending</option><option value="received">received</option></select></div><div><label>Requirements Done?</label><select id="requirements_done"><option value="yes">yes</option><option value="no">no</option></select></div></div>
+      <div class="row"><div><label>Issue Remaining?</label><select id="issue"><option value="no">no</option><option value="yes">yes</option></select></div><div><label>AI Resolved? (if issue=yes)</label><select id="ai_resolved"><option value="">n/a</option><option value="yes">yes</option><option value="no">no</option></select></div></div>
+      <div class="btns"><button onclick="documentFlow()">Process Document Flow</button><button onclick="issueFlow()">Process Issue Flow</button></div>
+    </section>
+    <section class="card"><h3>Feedback + Final</h3>
+      <div class="row"><div><label>Rating 1-10</label><input id="score" type="number" min="1" max="10" value="8"/></div><div><label>Negative Resolved? (for 1-4 branch)</label><select id="resolved"><option value="yes">yes</option><option value="no">no</option></select></div></div>
+      <div class="btns"><button onclick="feedbackFlow()">Process Feedback Flow</button><button onclick="finalizeFlow()">Finalize (Dashboard + Plans + Learning)</button><button onclick="dashboard()">Dashboard</button><button onclick="dayPlan()">Day Plan</button><button onclick="learning()">Learning</button></div>
+    </section>
+  </main><aside>
+    <section class="card"><h3>Current state</h3><div><span class="chip" id="st">unknown</span></div><div id="na"></div></section>
+    <section class="card"><h3>API response</h3><pre id="out">Ready.</pre></section>
+  </aside></div>
+<script>
+const out=document.getElementById('out');const st=document.getElementById('st');const na=document.getElementById('na');
+function headers(){const h={'Content-Type':'application/json'};const k=(document.getElementById('adminkey').value||'').trim();if(k)h['X-Admin-Api-Key']=k;return h;}
+function brand(){return (document.getElementById('brand').value||'').trim();} function lead(){return (document.getElementById('lead').value||'').trim();}
+function consume(j){if(j&&j.session&&j.session.status){st.textContent=j.session.status;} if(j&&Array.isArray(j.next_allowed_actions)){na.innerHTML=j.next_allowed_actions.map(x=>'<span class="chip">'+x+'</span>').join(' ');}}
+async function api(p,m='GET',b=null){const r=await fetch(p,{method:m,headers:headers(),body:b?JSON.stringify(b):null});const j=await r.json().catch(()=>({raw:'non-json'}));if(!r.ok)j._http={status:r.status};out.textContent=JSON.stringify(j,null,2);consume(j);return j;}
+async function start(){await api('/v1/postsale/start','POST',{brand_id:brand(),lead_id:lead(),timezone:document.getElementById('tz').value,language:document.getElementById('lang').value,auto_language_switch:document.getElementById('autosw').value==='true'});await api('/v1/postsale/action','POST',{brand_id:brand(),lead_id:lead(),action:'load_requirements'});}
+async function paymentFlow(){await api('/v1/postsale/flow/payment','POST',{brand_id:brand(),lead_id:lead(),payment_status:document.getElementById('pay').value,owner_confirm:document.getElementById('owner_confirm').value||null,confirm_again:document.getElementById('confirm_again').value||null,note:document.getElementById('pay_note').value||''});}
+async function documentFlow(){await api('/v1/postsale/flow/document','POST',{brand_id:brand(),lead_id:lead(),document_status:document.getElementById('doc').value});}
+async function issueFlow(){const ai=document.getElementById('ai_resolved').value;await api('/v1/postsale/flow/issue','POST',{brand_id:brand(),lead_id:lead(),requirements_done:document.getElementById('requirements_done').value==='yes',issue_remaining:document.getElementById('issue').value==='yes',ai_resolved:ai===''?null:(ai==='yes')});}
+async function feedbackFlow(){await api('/v1/postsale/flow/feedback','POST',{brand_id:brand(),lead_id:lead(),score:Number(document.getElementById('score').value||0),negative_resolved:document.getElementById('resolved').value==='yes'});}
+async function finalizeFlow(){await api('/v1/postsale/flow/finalize','POST',{brand_id:brand(),lead_id:lead()});}
+async function timeline(){await api('/v1/postsale/timeline?brand_id='+encodeURIComponent(brand())+'&lead_id='+encodeURIComponent(lead()));}
+async function dashboard(){await api('/v1/postsale/dashboard?brand_id='+encodeURIComponent(brand()));}
+async function dayPlan(){await api('/v1/postsale/day_plan','POST',{brand_id:brand()});}
+async function learning(){await api('/v1/postsale/learning','POST',{brand_id:brand()});}
+</script></body></html>"""
+    return Response(html, mimetype="text/html; charset=utf-8")
+
+
+@app.post("/v1/postsale/start")
+def postsale_start():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    brand_id = str(body.get("brand_id") or "").strip()
+    lead_id = str(body.get("lead_id") or "").strip()
+    if not brand_id or not lead_id:
+        return _err(400, "brand_id and lead_id required")
+    tz = str(body.get("timezone") or "Asia/Kolkata").strip()
+    lang = str(body.get("language") or "hinglish").strip().lower()
+    try:
+        auto_parsed = _parse_bool_field(body, "auto_language_switch", required=False)
+    except ValueError as e:
+        return _err(400, str(e))
+    auto = True if auto_parsed is None else auto_parsed
+    try:
+        s = postsaleops.upsert_session(
+            brand_id=brand_id,
+            lead_id=lead_id,
+            timezone=tz,
+            language=lang,
+            auto_language_switch=auto,
+            stage="init",
+            status="started",
+            payment_status="pending",
+            document_status="pending",
+        )
+        postsaleops.add_event(brand_id=brand_id, lead_id=lead_id, event_type="start", payload={"timezone": tz, "language": lang})
+    except ValueError as e:
+        return _err(400, str(e))
+    leads.merge_raw(lead_id, {"postsale_timezone": tz, "postsale_language": lang, "postsale_auto_language_switch": auto})
+    return _postsale_ok(s, audit={"initial_status": "started", "actions_applied": ["start"], "final_status": s.status, "stage": "init"})
+
+
+@app.post("/v1/postsale/payment_status")
+def postsale_payment_status():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    ps = str(body.get("payment_status") or "").strip().lower()
+    if ps not in {"pending", "partial"}:
+        return _err(400, "payment_status must be pending/partial")
+    brand_id = str(body.get("brand_id") or "").strip()
+    lead_id = str(body.get("lead_id") or "").strip()
+    if not brand_id or not lead_id:
+        return _err(400, "brand_id and lead_id required")
+    action = "set_payment_pending" if ps == "pending" else "set_payment_partial"
+    try:
+        s = postsaleops.upsert_session(brand_id=brand_id, lead_id=lead_id, stage="payment", status=action, payment_status=ps)
+        postsaleops.add_event(brand_id=brand_id, lead_id=lead_id, event_type="payment_status", payload={"payment_status": ps})
+    except ValueError as e:
+        return _err(400, str(e))
+    return _postsale_ok(s, audit={"initial_status": "n/a", "actions_applied": [action], "final_status": s.status, "stage": "payment"})
+
+
+@app.post("/v1/postsale/document_status")
+def postsale_document_status():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    ds = str(body.get("document_status") or "").strip().lower()
+    if ds not in {"pending", "received"}:
+        return _err(400, "document_status must be pending/received")
+    brand_id = str(body.get("brand_id") or "").strip()
+    lead_id = str(body.get("lead_id") or "").strip()
+    if not brand_id or not lead_id:
+        return _err(400, "brand_id and lead_id required")
+    action = "request_documents" if ds == "pending" else "receive_document"
+    try:
+        s = postsaleops.upsert_session(brand_id=brand_id, lead_id=lead_id, stage="document", status=action, document_status=ds)
+        postsaleops.add_event(brand_id=brand_id, lead_id=lead_id, event_type="document_status", payload={"document_status": ds})
+    except ValueError as e:
+        return _err(400, str(e))
+    return _postsale_ok(s, audit={"initial_status": "n/a", "actions_applied": [action], "final_status": s.status, "stage": "document"})
+
+
+@app.post("/v1/postsale/issue_status")
+def postsale_issue_status():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    brand_id = str(body.get("brand_id") or "").strip()
+    lead_id = str(body.get("lead_id") or "").strip()
+    if not brand_id or not lead_id:
+        return _err(400, "brand_id and lead_id required")
+    try:
+        issue_remaining_parsed = _parse_bool_field(body, "issue_remaining", required=False)
+    except ValueError as e:
+        return _err(400, str(e))
+    issue_remaining = False if issue_remaining_parsed is None else issue_remaining_parsed
+    action = "issue_remaining_yes" if issue_remaining else "issue_remaining_no"
+    try:
+        s = postsaleops.upsert_session(brand_id=brand_id, lead_id=lead_id, stage="issue", status=action)
+        postsaleops.add_event(brand_id=brand_id, lead_id=lead_id, event_type="issue_status", payload={"issue_remaining": issue_remaining})
+    except ValueError as e:
+        return _err(400, str(e))
+    return _postsale_ok(s, audit={"initial_status": "n/a", "actions_applied": [action], "final_status": s.status, "stage": "issue"})
+
+
+@app.post("/v1/postsale/score")
+def postsale_score():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    try:
+        score = int(body.get("score") or 0)
+    except (TypeError, ValueError):
+        return _err(400, "score must be integer")
+    if score < 1 or score > 10:
+        return _err(400, "score must be 1..10")
+    try:
+        resolved_parsed = _parse_bool_field(body, "resolved", required=False)
+    except ValueError as e:
+        return _err(400, str(e))
+    resolved = True if resolved_parsed is None else resolved_parsed
+    brand_id = str(body.get("brand_id") or "").strip()
+    lead_id = str(body.get("lead_id") or "").strip()
+    if not brand_id or not lead_id:
+        return _err(400, "brand_id and lead_id required")
+    if score >= 8:
+        status = "score_8_10"
+    elif score >= 5:
+        status = "score_5_7"
+    else:
+        status = "score_1_4"
+    try:
+        s = postsaleops.upsert_session(brand_id=brand_id, lead_id=lead_id, stage="score", status=status, rating=score)
+        postsaleops.add_event(brand_id=brand_id, lead_id=lead_id, event_type="score", payload={"score": score, "resolved": resolved, "status": status})
+    except ValueError as e:
+        return _err(400, str(e))
+    return _postsale_ok(s, audit={"initial_status": "n/a", "actions_applied": [status], "final_status": s.status, "stage": "score"})
+
+
+@app.post("/v1/postsale/flow/payment")
+def postsale_flow_payment():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    brand_id = str(body.get("brand_id") or "").strip()
+    lead_id = str(body.get("lead_id") or "").strip()
+    if not brand_id or not lead_id:
+        return _err(400, "brand_id and lead_id required")
+    ps = str(body.get("payment_status") or "").strip().lower()
+    owner_confirm = str(body.get("owner_confirm") or "").strip().lower()
+    confirm_again = str(body.get("confirm_again") or "").strip().lower()
+    note = str(body.get("note") or "").strip()
+    if ps not in {"pending", "partial"}:
+        return _err(400, "payment_status must be pending/partial")
+    if owner_confirm not in {"", "yes", "no"}:
+        return _err(400, "owner_confirm must be yes/no when provided")
+    if confirm_again not in {"", "yes", "no"}:
+        return _err(400, "confirm_again must be yes/no when provided")
+    if ps == "pending" and (owner_confirm or confirm_again):
+        return _err(400, "owner_confirm/confirm_again are not valid when payment_status=pending")
+    if owner_confirm == "no" and confirm_again:
+        return _err(400, "confirm_again is only valid when owner_confirm=yes")
+
+    try:
+        if ps == "pending":
+            s, audit = _postsale_apply_actions(
+                brand_id=brand_id,
+                lead_id=lead_id,
+                actions=["set_payment_pending", "send_payment_reminder", "retry_d0_d3_d5_d7"],
+                event_type="payment_flow",
+                payload={"payment_status": ps, "path": "reminder_retry_loop", "note": note},
+                stage="payment",
+            )
+            s = postsaleops.upsert_session(brand_id=brand_id, lead_id=lead_id, payment_status="pending")
+            return _postsale_ok(s, audit=audit)
+
+        actions = ["set_payment_partial", "ask_payment_proof", "receive_proof", "send_to_owner_verification", "owner_whatsapp_verify_payment"]
+        if owner_confirm in {"yes", "no"}:
+            actions.append("owner_confirm_yes" if owner_confirm == "yes" else "owner_confirm_no")
+            if owner_confirm == "yes":
+                actions.append("send_second_confirmation")
+                if confirm_again in {"yes", "no"}:
+                    actions.append("confirm_again_yes" if confirm_again == "yes" else "confirm_again_no")
+                    actions.append("update_payment" if confirm_again == "yes" else "cancel_update")
+            else:
+                actions.append("cancel_update")
+        s, audit = _postsale_apply_actions(
+            brand_id=brand_id,
+            lead_id=lead_id,
+            actions=actions,
+            event_type="payment_flow",
+            payload={"payment_status": ps, "owner_confirm": owner_confirm or None, "confirm_again": confirm_again or None, "note": note},
+            stage="payment",
+        )
+        s = postsaleops.upsert_session(brand_id=brand_id, lead_id=lead_id, payment_status="partial")
+    except ValueError as e:
+        return _err(400, str(e))
+    return _postsale_ok(s, audit=audit)
+
+
+@app.post("/v1/postsale/flow/document")
+def postsale_flow_document():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    brand_id = str(body.get("brand_id") or "").strip()
+    lead_id = str(body.get("lead_id") or "").strip()
+    if not brand_id or not lead_id:
+        return _err(400, "brand_id and lead_id required")
+    ds = str(body.get("document_status") or "").strip().lower()
+    if ds not in {"pending", "received"}:
+        return _err(400, "document_status must be pending/received")
+    try:
+        actions = ["request_documents", "doc_followup_d0_d2_d4"] if ds == "pending" else ["receive_document", "validate_document"]
+        s, audit = _postsale_apply_actions(
+            brand_id=brand_id,
+            lead_id=lead_id,
+            actions=actions,
+            event_type="document_flow",
+            payload={"document_status": ds},
+            stage="document",
+        )
+        s = postsaleops.upsert_session(brand_id=brand_id, lead_id=lead_id, document_status=ds)
+    except ValueError as e:
+        return _err(400, str(e))
+    return _postsale_ok(s, audit=audit)
+
+
+@app.post("/v1/postsale/flow/issue")
+def postsale_flow_issue():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    brand_id = str(body.get("brand_id") or "").strip()
+    lead_id = str(body.get("lead_id") or "").strip()
+    if not brand_id or not lead_id:
+        return _err(400, "brand_id and lead_id required")
+    try:
+        requirements_done = bool(_parse_bool_field(body, "requirements_done", required=True))
+        issue_remaining = bool(_parse_bool_field(body, "issue_remaining", required=True))
+        ai_resolved = _parse_bool_field(body, "ai_resolved", required=False)
+    except ValueError as e:
+        return _err(400, str(e))
+
+    if not requirements_done:
+        return _err(400, "requirements_done must be true before issue flow")
+
+    if not issue_remaining:
+        actions = ["all_requirements_done", "issue_remaining_no", "proceed"]
+    elif ai_resolved is None:
+        actions = ["all_requirements_done", "issue_remaining_yes", "ai_try_resolve"]
+    else:
+        actions = ["all_requirements_done", "issue_remaining_yes", "ai_try_resolve", "resolved_yes" if ai_resolved else "resolved_no"]
+        actions.append("proceed" if ai_resolved else "owner_intervention")
+
+    try:
+        s, audit = _postsale_apply_actions(
+            brand_id=brand_id,
+            lead_id=lead_id,
+            actions=actions,
+            event_type="issue_flow",
+            payload={"requirements_done": requirements_done, "issue_remaining": issue_remaining, "ai_resolved": ai_resolved},
+            stage="issue",
+        )
+    except ValueError as e:
+        return _err(400, str(e))
+    return _postsale_ok(s, audit=audit)
+
+
+@app.post("/v1/postsale/flow/feedback")
+def postsale_flow_feedback():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    brand_id = str(body.get("brand_id") or "").strip()
+    lead_id = str(body.get("lead_id") or "").strip()
+    if not brand_id or not lead_id:
+        return _err(400, "brand_id and lead_id required")
+    try:
+        score = int(body.get("score") or 0)
+    except (TypeError, ValueError):
+        return _err(400, "score must be integer")
+    if score < 1 or score > 10:
+        return _err(400, "score must be 1..10")
+    try:
+        negative_resolved_parsed = _parse_bool_field(body, "negative_resolved", required=False)
+    except ValueError as e:
+        return _err(400, str(e))
+    negative_resolved = True if negative_resolved_parsed is None else negative_resolved_parsed
+
+    if score >= 8:
+        actions = ["ask_rating_1_10", "score_8_10", "ask_referral"]
+    elif score >= 5:
+        actions = ["ask_rating_1_10", "score_5_7", "soft_referral"]
+    else:
+        actions = ["ask_rating_1_10", "score_1_4", "ai_resolve_first"]
+        actions.append("negative_resolved_yes" if negative_resolved else "negative_resolved_no")
+        actions.append("close" if negative_resolved else "owner_alert")
+
+    try:
+        s, audit = _postsale_apply_actions(
+            brand_id=brand_id,
+            lead_id=lead_id,
+            actions=actions,
+            event_type="feedback_flow",
+            payload={"score": score, "negative_resolved": negative_resolved},
+            stage="feedback",
+        )
+        s = postsaleops.upsert_session(brand_id=brand_id, lead_id=lead_id, rating=score)
+    except ValueError as e:
+        return _err(400, str(e))
+    return _postsale_ok(s, audit=audit)
+
+
+@app.post("/v1/postsale/flow/finalize")
+def postsale_flow_finalize():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    brand_id = str(body.get("brand_id") or "").strip()
+    lead_id = str(body.get("lead_id") or "").strip()
+    if not brand_id or not lead_id:
+        return _err(400, "brand_id and lead_id required")
+    try:
+        s, audit = _postsale_apply_actions(
+            brand_id=brand_id,
+            lead_id=lead_id,
+            actions=["update_dashboard", "learning_loop"],
+            event_type="finalize_flow",
+            payload={},
+            stage="reporting",
+        )
+    except ValueError as e:
+        return _err(400, str(e))
+    return _postsale_ok(s, audit=audit)
+
+
+@app.post("/v1/postsale/action")
+def postsale_action():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    brand_id = str(body.get("brand_id") or "").strip()
+    lead_id = str(body.get("lead_id") or "").strip()
+    action = str(body.get("action") or "").strip().lower()
+    all_actions = {a for v in _POSTSALE_ALLOWED_BY_STATUS.values() for a in v}
+    if action not in all_actions:
+        return _err(400, "invalid action")
+    cur = postsaleops.get_session(brand_id=brand_id, lead_id=lead_id)
+    current_status = cur.status if cur else "started"
+    allowed = _postsale_next_allowed(current_status)
+    if action not in allowed:
+        return _err(409, f"invalid transition from {current_status} -> {action}; allowed next: {', '.join(allowed) if allowed else '(none)'}")
+    stage = "flow"
+    next_action_at = None
+    if action in {"retry_d0_d3_d5_d7", "doc_followup_d0_d2_d4", "reschedule_next_day"}:
+        next_action_at = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+    if action in {"set_payment_pending", "send_payment_reminder", "ask_payment_proof", "receive_proof", "send_to_owner_verification", "owner_whatsapp_verify_payment"}:
+        stage = "payment"
+    elif action in {"request_documents", "doc_followup_d0_d2_d4", "receive_document", "validate_document"}:
+        stage = "document"
+    elif action in {"issue_remaining_yes", "issue_remaining_no", "ai_try_resolve", "owner_intervention"}:
+        stage = "issue"
+    elif action.startswith("score_") or action in {"ask_rating_1_10", "save_testimonial", "ask_referral", "ask_improvement", "soft_referral", "ai_resolve_first", "negative_resolved_yes", "negative_resolved_no"}:
+        stage = "feedback"
+    elif action in {"update_dashboard", "morning_plan", "evening_report", "learning_loop", "post_sale_system"}:
+        stage = "reporting"
+    try:
+        s = postsaleops.upsert_session(brand_id=brand_id, lead_id=lead_id, stage=stage, status=action, next_action_at=next_action_at)
+        e = postsaleops.add_event(brand_id=brand_id, lead_id=lead_id, event_type="diagram_action", payload={"action": action})
+    except ValueError as e:
+        return _err(400, str(e))
+    return _postsale_ok(
+        s,
+        event=e,
+        audit={"initial_status": current_status, "actions_applied": [action], "final_status": s.status, "stage": stage},
+    )
+
+
+@app.get("/v1/postsale/timeline")
+def postsale_timeline():
+    brand_id = str(request.args.get("brand_id") or "").strip()
+    lead_id = str(request.args.get("lead_id") or "").strip()
+    if not brand_id or not lead_id:
+        return _err(400, "brand_id and lead_id required")
+    try:
+        s = postsaleops.get_session(brand_id=brand_id, lead_id=lead_id)
+        ev = [e.__dict__ for e in postsaleops.list_events(brand_id=brand_id, lead_id=lead_id)]
+    except ValueError as e:
+        return _err(400, str(e))
+    return _postsale_data(
+        {"session": s.__dict__ if s else None, "events": ev},
+        audit={"endpoint": "timeline", "events_count": len(ev)},
+    )
+
+
+@app.get("/v1/postsale/dashboard")
+def postsale_dashboard():
+    brand_id = str(request.args.get("brand_id") or "").strip()
+    if not brand_id:
+        return _err(400, "brand_id required")
+    ss = [s for s in postsaleops.sessions.values() if s.brand_id == brand_id]
+    ev = [e for e in postsaleops.events.values() if e.brand_id == brand_id]
+    by_status: dict[str, int] = {}
+    for s in ss:
+        by_status[s.status] = by_status.get(s.status, 0) + 1
+    avg_rating = round(sum((s.rating or 0) for s in ss) / len([s for s in ss if s.rating is not None]), 2) if any(s.rating is not None for s in ss) else None
+    return _postsale_data(
+        {
+            "brand_id": brand_id,
+            "sessions_total": len(ss),
+            "events_total": len(ev),
+            "status_breakdown": by_status,
+            "average_rating": avg_rating,
+        },
+        audit={"endpoint": "dashboard", "sessions_count": len(ss), "events_count": len(ev)},
+    )
+
+
+@app.post("/v1/postsale/day_plan")
+def postsale_day_plan():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    brand_id = str(body.get("brand_id") or "").strip()
+    if not brand_id:
+        return _err(400, "brand_id required")
+    now = datetime.now(timezone.utc)
+    morning = [s.lead_id for s in postsaleops.sessions.values() if s.brand_id == brand_id and s.status in {"set_payment_pending", "send_payment_reminder", "request_documents"}][:20]
+    evening = [s.lead_id for s in postsaleops.sessions.values() if s.brand_id == brand_id and s.status in {"owner_alert", "negative_resolved_no", "doc_followup_d0_d2_d4"}][:20]
+    return _postsale_data(
+        {
+            "brand_id": brand_id,
+            "morning_plan": {"generated_at": now.isoformat(), "lead_ids": morning},
+            "evening_report": {"generated_at": now.isoformat(), "lead_ids": evening},
+        },
+        audit={"endpoint": "day_plan", "morning_count": len(morning), "evening_count": len(evening)},
+    )
+
+
+@app.post("/v1/postsale/learning")
+def postsale_learning():
+    body: dict[str, Any] = request.get_json(force=True, silent=True) or {}
+    brand_id = str(body.get("brand_id") or "").strip()
+    if not brand_id:
+        return _err(400, "brand_id required")
+    ss = [s for s in postsaleops.sessions.values() if s.brand_id == brand_id]
+    pending_payments = len([s for s in ss if s.status in {"set_payment_pending", "send_payment_reminder"}])
+    owner_alerts = len([s for s in ss if s.status in {"owner_alert", "negative_resolved_no"}])
+    if owner_alerts:
+        act = "Increase owner intervention speed for unresolved negative post-sale issues."
+    elif pending_payments:
+        act = "Prioritize payment reminders and proof verification in first half of day."
+    else:
+        act = "Scale testimonial + referral requests for satisfied customers."
+    return _postsale_data(
+        {
+            "brand_id": brand_id,
+            "learning_loop": {"recommended_action": act, "generated_at": datetime.now(timezone.utc).isoformat()},
+        },
+        audit={"endpoint": "learning", "pending_payments": pending_payments, "owner_alerts": owner_alerts},
+    )

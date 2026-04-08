@@ -176,6 +176,8 @@ class Generator:
                     continuity_text=str(continuity_text) if isinstance(continuity_text, str) and continuity_text.strip() else None,
                     storyboard=sb_list,
                     segment_captions=cap_list,
+                    logo_image_base64=str(opt.get("video_logo_image_base64") or "").strip() or None,
+                    logo_image_mime_type=str(opt.get("video_logo_image_mime_type") or "").strip() or None,
                 )
             else:
                 ds = int(duration_seconds) if isinstance(duration_seconds, (int, float)) and int(duration_seconds) > 0 else None

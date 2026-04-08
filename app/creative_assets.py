@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import ast
 from typing import Any
 
 from .settings import settings
@@ -65,6 +66,142 @@ def _get_video_planner():
 
 
 _ZW_SPACE_RE = re.compile(r"[\u200b-\u200d\ufeff]")
+
+
+def _parse_model_json_object(raw: str) -> dict[str, Any]:
+    """Best-effort parse for model JSON-ish outputs."""
+    txt = (raw or "").strip()
+    if not txt:
+        raise json.JSONDecodeError("empty", txt, 0)
+
+    # 1) strict JSON first
+    try:
+        data = json.loads(txt)
+        if isinstance(data, dict):
+            return data
+    except json.JSONDecodeError:
+        pass
+
+    # 2) extract first object and retry strict JSON
+    m = re.search(r"\{[\s\S]*\}", txt)
+    candidate = m.group(0) if m else txt
+    try:
+        data = json.loads(candidate)
+        if isinstance(data, dict):
+            return data
+    except json.JSONDecodeError:
+        pass
+
+    # 3) strip markdown/code fences + trailing commas + JSON booleans/null for literal_eval
+    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", candidate, flags=re.IGNORECASE | re.MULTILINE).strip()
+    cleaned = re.sub(r",(\s*[}\]])", r"\1", cleaned)  # trailing commas
+    cleaned = re.sub(r"\btrue\b", "True", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\bfalse\b", "False", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\bnull\b", "None", cleaned, flags=re.IGNORECASE)
+    try:
+        data = ast.literal_eval(cleaned)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+
+    raise json.JSONDecodeError("invalid json object", txt, 0)
+
+
+def _derive_brief_subject(brief: dict[str, Any]) -> str:
+    """Extract a short campaign subject from brief with robust fallbacks."""
+    candidates: list[str] = []
+    for k in (
+        "headline",
+        "summary",
+        "product_name",
+        "brand_name",
+        "business_name",
+        "campaign_goal",
+        "objective",
+        "context",
+        "source_text",
+    ):
+        v = brief.get(k)
+        if isinstance(v, str) and v.strip():
+            candidates.append(v.strip())
+    if not candidates:
+        # Last resort: compact brief blob and use first meaningful slice.
+        raw = json.dumps(brief, ensure_ascii=False, default=str)
+        raw = re.sub(r"\s+", " ", raw).strip()
+        return (raw[:80] + "...") if len(raw) > 80 else (raw or "campaign")
+    best = candidates[0]
+    return best[:80]
+
+
+def _fallback_production_plan(
+    *,
+    brief: dict[str, Any],
+    segs: int,
+    cn: int,
+    total: int,
+    clip: int,
+    gen_video: bool,
+    gen_carousel: bool,
+    gen_image: bool,
+    locked: list[str],
+    logo_persistent: bool,
+    lbl: str,
+    model_id: str,
+) -> dict[str, Any]:
+    """Deterministic fallback so campaign generation never fails on planner JSON."""
+    subject = _derive_brief_subject(brief)
+    arc = ["Hook", "Problem", "Solution", "Proof", "CTA"]
+    beats: list[dict[str, Any]] = []
+    if gen_video and segs > 0:
+        roles = ["hook", "problem", "solution", "proof", "cta"]
+        for i in range(segs):
+            role = roles[min(i, len(roles) - 1)]
+            on_screen = locked[min(i, len(locked) - 1)] if locked else ""
+            beats.append(
+                {
+                    "clip_index": i + 1,
+                    "role": role,
+                    "storyboard_action": f"{role.title()} scene for {subject} in a clean professional setting.",
+                    "on_screen_text": _normalize_overlay_string(on_screen, 120),
+                    "logo_treatment": "Persistent corner logo bug." if logo_persistent else "Subtle logo placement.",
+                    "voiceover_line": f"{subject}: {role} message.",
+                    "transition": "Clean cut",
+                    "music_cue": "Corporate upbeat pulse",
+                }
+            )
+    panels: list[dict[str, Any]] = []
+    if gen_carousel and cn > 0:
+        for i in range(cn):
+            panels.append(
+                {
+                    "panel_index": i + 1,
+                    "headline": f"{subject[:40]}".strip() or f"Panel {i + 1}",
+                    "subline": f"Key benefit {i + 1}",
+                    "visual_focus": f"Professional visual centered on {subject}.",
+                    "logo_rule": "Consistent logo placement on all panels.",
+                }
+            )
+    return {
+        "one_line_summary": f"Production plan for {subject}.",
+        "campaign_arc": arc,
+        "video_beats": beats,
+        "carousel_panels": panels,
+        "still_image_notes": f"Create clean, brand-safe still imagery for {subject}." if gen_image else "",
+        "continuity_addon": "Maintain consistent style, talent, lighting, and brand tone.",
+        "hero_prompt_addon": f"Professional commercial style focused on {subject}.",
+        "carousel_prompt_addon": f"Each panel should advance one clear benefit of {subject}.",
+        "image_prompt_addon": f"High-quality product-focused visual for {subject}.",
+        "audio_mix_notes": "Clear voiceover over light corporate music; prioritize speech clarity." if gen_video else "",
+        "music_direction": "Modern corporate, medium tempo, positive." if gen_video else "",
+        "production_plan_model": model_id + ":fallback",
+        "segments": segs if gen_video else 0,
+        "clip_seconds": clip if gen_video else 0,
+        "total_seconds": total if gen_video else 0,
+        "copy_locked_lines": list(locked),
+        "logo_persistent": bool(logo_persistent),
+        "logo_label": lbl or None,
+    }
 
 
 _TYPOGRAPHY_CONTINUITY = (
@@ -657,7 +794,7 @@ Output valid JSON only. Arrays must have exact lengths: video_beats={segs}, caro
             raise RuntimeError("no candidates from production planner")
         parts = resp.candidates[0].content.parts
         raw = "".join(getattr(p, "text", "") or "" for p in parts).strip()
-        data = json.loads(raw)
+        data = _parse_model_json_object(raw)
         if not isinstance(data, dict):
             raise RuntimeError("production planner returned non-object JSON")
         return data
@@ -674,10 +811,7 @@ Output valid JSON only. Arrays must have exact lengths: video_beats={segs}, caro
             raise RuntimeError("no candidates from production planner")
         parts = resp.candidates[0].content.parts
         raw = "".join(getattr(p, "text", "") or "" for p in parts).strip()
-        m = re.search(r"\{[\s\S]*\}", raw)
-        if not m:
-            raise RuntimeError("production planner returned no JSON object")
-        data = json.loads(m.group(0))
+        data = _parse_model_json_object(raw)
         if not isinstance(data, dict):
             raise RuntimeError("production planner returned non-object JSON")
         return data
@@ -690,7 +824,20 @@ Output valid JSON only. Arrays must have exact lengths: video_beats={segs}, caro
             data = _text_mode()
     except json.JSONDecodeError:
         log.exception("production plan JSON parse")
-        raise RuntimeError("production planner returned invalid JSON") from None
+        return _fallback_production_plan(
+            brief=brief,
+            segs=segs,
+            cn=cn,
+            total=total,
+            clip=clip,
+            gen_video=gen_video,
+            gen_carousel=gen_carousel,
+            gen_image=gen_image,
+            locked=locked,
+            logo_persistent=logo_persistent,
+            lbl=lbl,
+            model_id=model_id,
+        )
 
     beats: list[dict[str, Any]] = []
     if segs > 0:
@@ -960,6 +1107,15 @@ def derive_script_audio_spec(
         "total_seconds": total_s,
     }
     vp_json = json.dumps(vp_trim, ensure_ascii=False, default=str)
+    ar = _ad_requirements_dict(brief)
+    video_lang = str(ar.get("video_language") or "auto").strip().lower() or "auto"
+    if video_lang == "auto":
+        lang_clause = "Language: infer from brief and primary_market; use a single coherent language per ad."
+    else:
+        lang_clause = (
+            f"Language requirement: voiceover and spoken phrasing must be in {video_lang}. "
+            "Do not switch to unrelated languages."
+        )
 
     user = f"""You are a broadcast copy chief + sound designer for paid social ads.
 
@@ -996,6 +1152,7 @@ Rules:
 - Align timing_map to ~{clip_s}s per clip; t_end_sec - t_start_sec ≈ {clip_s} (last clip may be shorter if total not divisible).
 - Music and VO must work in rhythm with cuts; call out sync explicitly.
 - If brief.ad_requirements exists, honor brand voice, primary_market, marketing_localization_notes, and CTA.
+- {lang_clause}
 - When primary_market is India (or brief says so): prefer clear Indian English VO (neutral professional), natural code-mix only if brief implies it; subtle India-appropriate corporate music bed — keep music supportive, not distracting (client-grade mix).
 - Sound like a premium ad: confident, concise, not cheesy.
 
@@ -1097,6 +1254,7 @@ Output valid JSON only. timing_map must have exactly {segs} items."""
     return {
         "one_line_audio_summary": _s("one_line_audio_summary", 400, "Professional VO + music locked to edits."),
         "ad_script_full": _s("ad_script_full", 3000),
+        "language": video_lang,
         "voiceover_direction": vd,
         "music_spec": ms,
         "timing_map": rows,

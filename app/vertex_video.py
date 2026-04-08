@@ -146,8 +146,12 @@ def _concat_mp4_ffmpeg(paths: list[str], out_path: str) -> None:
             "+faststart",
             "-c:a",
             "aac",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
             "-b:a",
-            "128k",
+            "192k",
             out_path,
         ]
         subprocess.run(cmd, check=True)
@@ -162,6 +166,88 @@ def _upload_file_to_gcs(client: storage.Client, bucket_name: str, object_name: s
     blob = client.bucket(bucket_name).blob(object_name)
     blob.upload_from_filename(path, content_type="video/mp4")
     return f"gs://{bucket_name}/{object_name}"
+
+
+def _ffprobe_duration_seconds(path: str) -> float:
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        path,
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or r.stdout or "ffprobe failed").strip())
+    raw = (r.stdout or "").strip()
+    try:
+        return float(raw)
+    except ValueError as e:
+        raise RuntimeError(f"invalid ffprobe duration output: {raw}") from e
+
+
+def _overlay_logo_on_video(src: str, dst: str, logo_path: str) -> None:
+    margin = int((os.getenv("VERTEX_VIDEO_LOGO_MARGIN") or "28").strip() or "28")
+    width_pct = float((os.getenv("VERTEX_VIDEO_LOGO_WIDTH_PCT") or "0.14").strip() or "0.14")
+    width_pct = min(0.35, max(0.06, width_pct))
+    alpha = float((os.getenv("VERTEX_VIDEO_LOGO_ALPHA") or "0.95").strip() or "0.95")
+    alpha = min(1.0, max(0.1, alpha))
+    pos = (os.getenv("VERTEX_VIDEO_LOGO_POSITION") or "top-right").strip().lower()
+    if pos == "top-left":
+        x_expr = f"{margin}"
+        y_expr = f"{margin}"
+    elif pos == "bottom-left":
+        x_expr = f"{margin}"
+        y_expr = f"H-h-{margin}"
+    elif pos == "bottom-right":
+        x_expr = f"W-w-{margin}"
+        y_expr = f"H-h-{margin}"
+    else:
+        x_expr = f"W-w-{margin}"
+        y_expr = f"{margin}"
+    vf = (
+        f"[1:v]format=rgba,colorchannelmixer=aa={alpha},"
+        f"scale=iw*min(1\\,W*{width_pct}/iw):-1[logo];"
+        f"[0:v][logo]overlay={x_expr}:{y_expr}:format=auto"
+    )
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        src,
+        "-i",
+        logo_path,
+        "-filter_complex",
+        vf,
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "23",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        "-c:a",
+        "aac",
+        "-ar",
+        "48000",
+        "-ac",
+        "2",
+        "-b:a",
+        "192k",
+        dst,
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or r.stdout or "ffmpeg logo overlay failed").strip())
 
 
 def _enforce_veo_fast_duration(seconds: int) -> int:
@@ -189,6 +275,8 @@ def generate_long_video_stitched(
     continuity_text: str | None = None,
     storyboard: list[str] | None = None,
     segment_captions: list[str] | None = None,
+    logo_image_base64: str | None = None,
+    logo_image_mime_type: str | None = None,
 ) -> dict[str, Any]:
     """
     Build a long video by generating multiple short clips and stitching them.
@@ -294,8 +382,37 @@ def generate_long_video_stitched(
                 clip_paths.append(p_raw)
         stitched_path = os.path.join(td, "stitched.mp4")
         _concat_mp4_ffmpeg(clip_paths, stitched_path)
+        final_path = stitched_path
+        if isinstance(logo_image_base64, str) and logo_image_base64.strip():
+            raw_logo = logo_image_base64.strip()
+            if raw_logo.startswith("data:"):
+                try:
+                    _, raw_logo = raw_logo.split(",", 1)
+                except ValueError:
+                    raw_logo = ""
+            if raw_logo:
+                logo_ext = ".png"
+                mt = (logo_image_mime_type or "").strip().lower()
+                if "jpeg" in mt or "jpg" in mt:
+                    logo_ext = ".jpg"
+                logo_path = os.path.join(td, "logo" + logo_ext)
+                try:
+                    with open(logo_path, "wb") as lf:
+                        lf.write(base64.b64decode(raw_logo, validate=True))
+                    overlaid = os.path.join(td, "stitched_logo.mp4")
+                    _overlay_logo_on_video(stitched_path, overlaid, logo_path)
+                    final_path = overlaid
+                except Exception:
+                    # Do not fail the whole pipeline if logo decode/overlay fails.
+                    final_path = stitched_path
+        dur_actual = _ffprobe_duration_seconds(final_path)
+        tol = float((os.getenv("VERTEX_VIDEO_DURATION_TOLERANCE_SEC") or "3.0").strip() or "3.0")
+        if abs(dur_actual - float(total)) > max(1.0, tol):
+            raise RuntimeError(
+                f"stitched video duration mismatch: requested={total}s actual={dur_actual:.2f}s"
+            )
         obj = f"salespal-assets/stitched_{int(time.time())}_{segs}x{clip}s.mp4"
-        stitched_gs = _upload_file_to_gcs(client, bucket_name, obj, stitched_path)
+        stitched_gs = _upload_file_to_gcs(client, bucket_name, obj, final_path)
 
     return {
         "prompt": prompt,
@@ -304,8 +421,11 @@ def generate_long_video_stitched(
         "total_seconds": total,
         "clip_seconds": clip,
         "segments": segs,
+        "requested_total_seconds": total,
+        "actual_duration_seconds": round(dur_actual, 2),
         "segment_prompts": segment_prompts,
         "caption_burn_in": burn_in,
+        "logo_overlay_applied": bool(logo_image_base64 and str(logo_image_base64).strip()),
         "videos": [{"mime_type": "video/mp4", "gcs_uri": stitched_gs}],
     }
 
@@ -324,6 +444,7 @@ def generate_videos_veo(
     poll_interval_sec: float | None = None,
     poll_max_sec: float | None = None,
     generate_audio: bool | None = None,
+    _rai_retry_attempted: bool = False,
 ) -> dict[str, Any]:
     model_id = model_id.strip()
     duration = int(duration_seconds if duration_seconds is not None else (os.getenv("VERTEX_VIDEO_DURATION_SECONDS") or "8"))
@@ -393,6 +514,31 @@ def generate_videos_veo(
                     videos_out.append(item)
             rai_n = resp.get("raiMediaFilteredCount")
             if not videos_out:
+                retry_enabled = (os.getenv("VERTEX_VIDEO_RAI_RETRY_ENABLED") or "1").strip().lower() not in ("0", "false", "no")
+                if retry_enabled and not _rai_retry_attempted:
+                    retry_prompt = (
+                        "Single adult subject in a clean professional office setting, neutral and brand-safe commercial tone. "
+                        "No sensitive content, no crowd scene, no risky framing. "
+                        + (prompt or "")[:700]
+                    )
+                    extra_neg = "violence, blood, weapon, nudity, explicit content, hate symbols, injury"
+                    merged_neg = ((neg or "").strip() + ", " + extra_neg).strip(", ").strip()
+                    return generate_videos_veo(
+                        project_id=project_id,
+                        location=location,
+                        model_id=model_id,
+                        prompt=retry_prompt,
+                        sample_count=1,
+                        duration_seconds=min(max(4, duration), 6),
+                        aspect_ratio=aspect,
+                        resolution=resolution,
+                        negative_prompt=merged_neg,
+                        storage_uri=storage_uri,
+                        poll_interval_sec=poll_interval,
+                        poll_max_sec=max_wait,
+                        generate_audio=generate_audio,
+                        _rai_retry_attempted=True,
+                    )
                 hint = (
                     " Vertex often returns an empty list when every sample was removed by safety/RAI filters "
                     "(see raiMediaFilteredCount). Retry with a shorter segment prompt, simpler scene, fewer people, "
